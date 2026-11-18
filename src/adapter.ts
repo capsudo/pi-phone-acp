@@ -1,148 +1,205 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import * as acp from '@agentclientprotocol/sdk'
-import type { PhoneBackend, PhoneSession } from './phone.js'
+import type { PhoneBackend, PhoneEvent, PhoneSession } from './phone.js'
+
+class LocalError extends acp.RequestError {}
+const local = (error: acp.RequestError) => new LocalError(error.code, error.message, error.data)
+const failureMessage = 'Phone operation failed. Reconnect to the same phone conversation to check its state. No automatic resubmission was attempted.'
 
 interface ActivePrompt {
   requestId: string
+  started: boolean
+  cancelRequested: boolean
+  observer: AbortController
   cancellation?: Promise<void>
 }
-
 interface AttachedSession {
+  controller: AbortController
   prompt?: ActivePrompt
+  watcher?: { controller: AbortController, done: Promise<void> }
+  tools: Set<string>
+  approvals: Set<string>
 }
 
-/** One ACP connection. All durable session state belongs to the backend. */
+/** One ACP connection. All durable session state belongs to the phone. */
 export function createAdapter(phone: PhoneBackend): acp.AgentApp {
   const sessions = new Map<string, AttachedSession>()
+  const loading = new Set<string>()
   const lifetime = new AbortController()
   const app = acp.agent({ name: 'pi-phone-acp' })
 
+  const safe = async <T>(action: () => Promise<T>): Promise<T> => {
+    try { return await action() } catch (error) {
+      if (error instanceof LocalError) throw error
+      // Backend exceptions, even RequestError instances, may contain secrets.
+      throw new acp.RequestError(-32000, failureMessage)
+    }
+  }
   const session = (id: string) => {
     const attached = sessions.get(id)
-    if (!attached) throw acp.RequestError.sessionNotFound(id)
+    if (!attached) throw local(acp.RequestError.sessionNotFound(id))
+    if (loading.has(id)) throw local(acp.RequestError.invalidRequest(undefined, 'Conversation is loading'))
     return attached
   }
-
-  const attach = (native: PhoneSession) => {
+  const attach = (native: PhoneSession): AttachedSession => {
     if (!native.id) throw new Error('Invalid native session')
-    sessions.set(native.id, {})
+    const attached: AttachedSession = { controller: new AbortController(), tools: new Set(), approvals: new Set() }
+    sessions.set(native.id, attached)
+    return attached
   }
-
-  const withSafeError = async <T>(action: () => Promise<T>): Promise<T> => {
-    try {
-      return await action()
-    } catch (error) {
-      if (error instanceof acp.RequestError) throw error
-      // Network and backend errors can contain credential-bearing URLs or headers.
-      // Never expose their message, cause, stack or response body over ACP.
-      throw new acp.RequestError(-32000, 'Phone operation failed. Reconnect to the same phone conversation to check its state. No automatic resubmission was attempted.')
-    }
-  }
-
   const validateWorkspace = (params: acp.NewSessionRequest | acp.LoadSessionRequest) => {
-    if (!isAbsolute(params.cwd)) {
-      throw acp.RequestError.invalidParams(undefined, 'cwd must be an absolute path')
+    if (!isAbsolute(params.cwd)) throw local(acp.RequestError.invalidParams(undefined, 'cwd must be an absolute path'))
+    if (params.additionalDirectories?.length) throw local(acp.RequestError.invalidParams(undefined, 'Additional client directories cannot be mounted on the phone.'))
+    if (params.systemPrompt) throw local(acp.RequestError.invalidParams(undefined, 'Client system prompts are not supported. Configure instructions on the phone.'))
+  }
+  const send = async (id: string, update: acp.SessionUpdate, client: acp.AgentContext) => {
+    await client.notify(acp.methods.client.session.update, { sessionId: id, update })
+  }
+  const notice = (id: string, text: string, client: acp.AgentContext) => send(id, {
+    sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `\n${text}\n` },
+  }, client)
+
+  const event = async (id: string, attached: AttachedSession, item: PhoneEvent, client: acp.AgentContext, signal: AbortSignal) => {
+    if (item.type === 'end') return
+    if (item.type === 'tool') {
+      const known = attached.tools.has(item.id)
+      attached.tools.add(item.id)
+      const fields = {
+        toolCallId: item.id, title: item.name, name: item.name, status: item.status,
+        ...(item.input === undefined ? {} : { rawInput: item.input }),
+        ...(item.output === undefined ? {} : { content: [{ type: 'content' as const, content: { type: 'text' as const, text: item.output } }] }),
+      }
+      await send(id, known ? { sessionUpdate: 'tool_call_update', ...fields } : { sessionUpdate: 'tool_call', ...fields }, client)
+    } else if (item.type === 'approval') {
+      if (attached.approvals.has(item.id)) return
+      attached.approvals.add(item.id)
+      if (item.interactive || !phone.answerApproval) {
+        await notice(id, '[Phone is waiting for an interactive approval. Complete it in pi-phone. Nothing was approved automatically.]', client)
+        return
+      }
+      // Do not block observation on a UI answer. Disconnecting cancels only the
+      // local question and never sends an allow/deny to the phone.
+      void (async () => {
+        const answer = await client.request(acp.methods.client.session.requestPermission, {
+          sessionId: id,
+          toolCall: { toolCallId: item.callId, title: `${item.tool}: ${item.subject}`, kind: 'other', content: [{ type: 'content', content: { type: 'text', text: item.reason } }] },
+          options: [
+            { optionId: 'allow', name: 'Allow once', kind: 'allow_once' },
+            { optionId: 'deny', name: 'Deny once', kind: 'reject_once' },
+          ],
+        }, { cancellationSignal: signal, stopWaitingOnCancel: true })
+        if (signal.aborted || answer.outcome.outcome !== 'selected') return
+        const choice = answer.outcome.optionId
+        if (choice !== 'allow' && choice !== 'deny') return
+        await phone.answerApproval!(item.id, choice === 'allow', signal)
+      })().catch(async () => {
+        attached.approvals.delete(item.id)
+        if (!signal.aborted) await notice(id, '[Could not resolve phone approval. Check it in pi-phone.]', client).catch(() => {})
+      })
+    } else {
+      await send(id, {
+        sessionUpdate: item.type === 'user' ? 'user_message_chunk' : item.type === 'thought' ? 'agent_thought_chunk' : 'agent_message_chunk',
+        content: { type: 'text', text: item.type === 'notice' ? `\n${item.text}\n` : item.text },
+      }, client)
     }
-    if (params.mcpServers.length !== 0) {
-      throw acp.RequestError.invalidParams(undefined, 'Client MCP servers are not supported. Configure tools on the phone instead.')
-    }
-    if (params.additionalDirectories?.length) {
-      throw acp.RequestError.invalidParams(undefined, 'Additional client directories cannot be mounted on the phone.')
-    }
+  }
+
+  const stopWatch = async (attached: AttachedSession) => {
+    attached.watcher?.controller.abort()
+    await attached.watcher?.done
+    delete attached.watcher
+  }
+  const startWatch = (id: string, attached: AttachedSession, client: acp.AgentContext) => {
+    if (!phone.observe || lifetime.signal.aborted) return
+    const controller = new AbortController()
+    const signal = AbortSignal.any([controller.signal, attached.controller.signal, lifetime.signal])
+    const done = (async () => {
+      try {
+        for await (const item of phone.observe!(id, signal)) {
+          signal.throwIfAborted()
+          await event(id, attached, item, client, signal)
+        }
+      } catch {
+        if (!signal.aborted) await notice(id, '[Phone observation disconnected. Reload this same conversation to reconnect. Work on the phone was not cancelled.]', client).catch(() => {})
+      }
+    })()
+    attached.watcher = { controller, done }
   }
 
   app.onConnect(connection => {
     connection.signal.addEventListener('abort', () => lifetime.abort(), { once: true })
   })
-
   app.onRequest(acp.methods.agent.initialize, ({ params }) => {
-    if (params.protocolVersion < acp.PROTOCOL_VERSION) {
-      throw acp.RequestError.unsupportedProtocolVersion(params.protocolVersion, [acp.PROTOCOL_VERSION])
-    }
+    if (params.protocolVersion < acp.PROTOCOL_VERSION) throw acp.RequestError.unsupportedProtocolVersion(params.protocolVersion, [acp.PROTOCOL_VERSION])
     return {
       protocolVersion: acp.PROTOCOL_VERSION,
       agentInfo: { name: 'pi-phone-acp', version: '0.1.0' },
-      agentCapabilities: {
-        loadSession: true,
-        promptCapabilities: { image: false, audio: false, embeddedContext: false },
-      },
+      agentCapabilities: { loadSession: true, promptCapabilities: { image: false, audio: false, embeddedContext: false } },
       authMethods: [],
     }
   })
-
-  app.onRequest(acp.methods.agent.session.new, ({ params, signal }) => withSafeError(async () => {
+  app.onRequest(acp.methods.agent.session.new, ({ params, signal, client }) => safe(async () => {
     validateWorkspace(params)
-    // The client's cwd is not a phone path and must never be used as one.
     const native = await phone.create(AbortSignal.any([signal, lifetime.signal]))
-    attach(native)
+    if (sessions.has(native.id)) throw new Error('Phone reused a session ID')
+    const attached = attach(native)
+    if (params.mcpServers.length) await notice(native.id, '[Client MCP servers are not connected. Configure tools on the phone. Client-host commands and credentials are not forwarded to Android.]', client)
+    startWatch(native.id, attached, client)
     return { sessionId: native.id }
   }))
-
-  app.onRequest(acp.methods.agent.session.load, ({ params, signal, client }) => withSafeError(async () => {
+  app.onRequest(acp.methods.agent.session.load, ({ params, signal, client }) => safe(async () => {
     validateWorkspace(params)
-    if (sessions.get(params.sessionId)?.prompt) {
-      throw acp.RequestError.invalidRequest(undefined, 'A prompt is already active for this conversation')
-    }
-    const native = await phone.load(params.sessionId, AbortSignal.any([signal, lifetime.signal]))
-    if (native.id !== params.sessionId) throw new Error('Native session mismatch')
-    for (const message of native.history) {
-      await client.notify(acp.methods.client.session.update, {
-        sessionId: native.id,
-        update: {
-          sessionUpdate: message.role === 'user' ? 'user_message_chunk' : 'agent_message_chunk',
-          content: { type: 'text', text: message.text },
-        },
-      })
-    }
-    attach(native)
-    return {}
-  }))
-
-  app.onRequest(acp.methods.agent.session.prompt, ({ params, signal, client }) => withSafeError(async () => {
-    const attached = session(params.sessionId)
-    if (attached.prompt) {
-      throw acp.RequestError.invalidRequest(undefined, 'A prompt is already active for this conversation')
-    }
-    if (params.prompt.some(block => block.type !== 'text')) {
-      throw acp.RequestError.invalidParams(undefined, 'Only text prompts are supported')
-    }
-    const text = params.prompt.map(block => block.type === 'text' ? block.text : '').join('\n')
-    if (!text.trim()) throw acp.RequestError.invalidParams(undefined, 'Prompt text must not be empty')
-
-    const active: ActivePrompt = { requestId: randomUUID() }
-    attached.prompt = active
-    const detached = AbortSignal.any([signal, lifetime.signal])
+    if (loading.has(params.sessionId) || sessions.get(params.sessionId)?.prompt) throw local(acp.RequestError.invalidRequest(undefined, 'A phone operation is already active for this conversation'))
+    loading.add(params.sessionId)
     try {
-      for await (const event of phone.run(params.sessionId, text, active.requestId, detached)) {
+      const old = sessions.get(params.sessionId)
+      if (old) { old.controller.abort(); await stopWatch(old) }
+      const detached = AbortSignal.any([signal, lifetime.signal])
+      const native = await phone.load(params.sessionId, detached)
+      if (native.id !== params.sessionId) throw new Error('Native session mismatch')
+      const attached = attach(native)
+      const replay: readonly PhoneEvent[] = native.replay ?? native.history.map(message => ({ type: message.role === 'user' ? 'user' : 'text', text: message.text }))
+      for (const item of replay) await event(native.id, attached, item, client, AbortSignal.any([attached.controller.signal, lifetime.signal]))
+      if (params.mcpServers.length) await notice(native.id, '[Client MCP servers are not connected. Configure tools on the phone. Client-host commands and credentials are not forwarded to Android.]', client)
+      startWatch(native.id, attached, client)
+      return {}
+    } finally { loading.delete(params.sessionId) }
+  }))
+  app.onRequest(acp.methods.agent.session.prompt, ({ params, signal, client }) => safe(async () => {
+    const attached = session(params.sessionId)
+    if (attached.prompt) throw local(acp.RequestError.invalidRequest(undefined, 'A prompt is already active for this conversation'))
+    if (params.prompt.some(block => block.type !== 'text')) throw local(acp.RequestError.invalidParams(undefined, 'Only text prompts are supported'))
+    const text = params.prompt.map(block => block.type === 'text' ? block.text : '').join('\n')
+    if (!text.trim()) throw local(acp.RequestError.invalidParams(undefined, 'Prompt text must not be empty'))
+    const active: ActivePrompt = { requestId: randomUUID(), started: false, cancelRequested: false, observer: new AbortController() }
+    attached.prompt = active
+    const detached = AbortSignal.any([signal, attached.controller.signal, lifetime.signal, active.observer.signal])
+    try {
+      await stopWatch(attached)
+      detached.throwIfAborted()
+      if (active.cancelRequested) return { stopReason: 'cancelled' }
+      active.started = true
+      for await (const item of phone.run(params.sessionId, text, active.requestId, detached)) {
         detached.throwIfAborted()
-        if (event.type === 'end') {
-          await active.cancellation
-          return { stopReason: event.reason }
-        }
-        await client.notify(acp.methods.client.session.update, {
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: event.type === 'thought' ? 'agent_thought_chunk' : 'agent_message_chunk',
-            content: { type: 'text', text: event.text },
-          },
-        })
+        if (item.type === 'end') { await active.cancellation; return { stopReason: item.reason } }
+        await event(params.sessionId, attached, item, client, detached)
       }
-      // Closing an observer is not proof that the phone's turn completed.
       throw new Error('Phone stream ended without a terminal result')
     } finally {
+      const keepObserving = !detached.aborted
+      active.observer.abort()
       delete attached.prompt
+      if (keepObserving) startWatch(params.sessionId, attached, client)
     }
   }))
-
   app.onNotification(acp.methods.agent.session.cancel, ({ params }) => {
     const active = sessions.get(params.sessionId)?.prompt
-    if (!active || active.cancellation) return
+    if (!active || active.cancelRequested) return
+    active.cancelRequested = true
+    if (!active.started) return
     active.cancellation = phone.cancel(params.sessionId, active.requestId)
-    // Notifications have no response. The prompt awaits cancellation before it
-    // reports completion, and this handler prevents an unhandled rejection.
-    void active.cancellation.catch(() => {})
+    void active.cancellation.catch(() => active.observer.abort())
   })
-
   return app
 }

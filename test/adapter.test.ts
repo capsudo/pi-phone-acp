@@ -114,14 +114,11 @@ test('uses phone conversation IDs rather than transient adapter IDs', async () =
   } finally { connection.close() }
 })
 
-test('rejects client tools and workspace mounts rather than executing them', async () => {
+test('rejects client workspace mounts rather than treating them as phone paths', async () => {
   const { phone, connection, agent } = connect()
   try {
     await initialize(agent)
     await assert.rejects(agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, { ...workspace, cwd: 'relative' }), { code: -32602 })
-    await assert.rejects(agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, {
-      ...workspace, mcpServers: [{ name: 'host-tools', command: '/bin/sh', args: ['untrusted'], env: [] }],
-    }), { code: -32602 })
     await assert.rejects(agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, {
       ...workspace, additionalDirectories: ['/host/files'],
     }), { code: -32602 })
@@ -256,5 +253,136 @@ test('a truncated phone event stream is not reported as successful completion', 
     await initialize(agent)
     const { sessionId } = await agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, workspace)
     await assert.rejects(agent.request(acp.methods.agent.session.prompt, promptFor(sessionId)), { code: -32000 })
+  } finally { connection.close() }
+})
+
+test('does not trust a backend RequestError with credential-bearing details', async () => {
+  const { phone, connection, agent } = connect()
+  try {
+    await initialize(agent)
+    phone.fail = new acp.RequestError(-32000, 'DO_NOT_LEAK', { token: 'DO_NOT_LEAK' })
+    await assert.rejects(agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, workspace), error => {
+      assert.ok(error instanceof Error)
+      assert.doesNotMatch(JSON.stringify(error) + error.message, /DO_NOT_LEAK/)
+      return true
+    })
+  } finally { connection.close() }
+})
+
+test('bridges a simple phone approval once, without inventing permanent approval options', async () => {
+  class ApprovalPhone extends FakePhone {
+    readonly answers: { id: string, allow: boolean }[] = []
+    override async *run() {
+      yield { type: 'approval' as const, id: 'a/1', callId: 'tool-1', tool: 'bash', subject: 'command', reason: 'phone policy', interactive: false }
+      yield { type: 'approval' as const, id: 'a/1', callId: 'tool-1', tool: 'bash', subject: 'command', reason: 'phone policy', interactive: false }
+      await new Promise(resolve => setImmediate(resolve))
+      yield { type: 'end' as const, reason: 'end_turn' as const }
+    }
+    async answerApproval(id: string, allow: boolean) { this.answers.push({ id, allow }) }
+  }
+  const phone = new ApprovalPhone()
+  let requests = 0
+  const peer = acp.client().onRequest(acp.methods.client.session.requestPermission, ({ params }) => {
+    requests++
+    assert.deepEqual(params.options.map(option => option.kind), ['allow_once', 'reject_once'])
+    return { outcome: { outcome: 'selected' as const, optionId: 'deny' } }
+  })
+  const connection = peer.connect(createAdapter(phone))
+  try {
+    await initialize(connection.agent)
+    const { sessionId } = await connection.agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, workspace)
+    await connection.agent.request(acp.methods.agent.session.prompt, promptFor(sessionId))
+    assert.equal(requests, 1)
+    assert.deepEqual(phone.answers, [{ id: 'a/1', allow: false }])
+  } finally { connection.close() }
+})
+
+test('leaves secret/interview approvals on the phone instead of treating them as allow/deny', async () => {
+  class InteractivePhone extends FakePhone {
+    override async *run() {
+      yield { type: 'approval' as const, id: 'secret', callId: 'tool', tool: 'secret_request', subject: 'hidden', reason: 'phone UI', interactive: true }
+      yield { type: 'end' as const, reason: 'end_turn' as const }
+    }
+    async answerApproval() { assert.fail('Interactive forms must not be approved') }
+  }
+  const { connection, agent, updates } = connect(new InteractivePhone())
+  try {
+    await initialize(agent)
+    const { sessionId } = await agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, workspace)
+    await agent.request(acp.methods.agent.session.prompt, promptFor(sessionId))
+    assert.ok(updates.some(item => item.update.sessionUpdate === 'agent_message_chunk' && item.update.content.type === 'text' && item.update.content.text.includes('Complete it in pi-phone')))
+  } finally { connection.close() }
+})
+
+test('does not answer a pending phone approval when ACP disconnects', async () => {
+  class PendingApprovalPhone extends FakePhone {
+    override async *run(_id: string, _text: string, _request: string, signal: AbortSignal) {
+      yield { type: 'approval' as const, id: 'pending', callId: 'tool', tool: 'bash', subject: 'command', reason: 'phone policy', interactive: false }
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+      signal.throwIfAborted()
+    }
+    async answerApproval() { assert.fail('Disconnect must not allow or deny') }
+  }
+  const asked = Promise.withResolvers<void>()
+  const peer = acp.client().onRequest(acp.methods.client.session.requestPermission, async ({ signal }) => {
+    asked.resolve()
+    await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+    return { outcome: { outcome: 'cancelled' as const } }
+  })
+  const connection = peer.connect(createAdapter(new PendingApprovalPhone()))
+  await initialize(connection.agent)
+  const { sessionId } = await connection.agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, workspace)
+  const prompt = connection.agent.request(acp.methods.agent.session.prompt, promptFor(sessionId))
+  const rejected = assert.rejects(prompt)
+  await asked.promise
+  connection.close()
+  await rejected
+  await new Promise(resolve => setImmediate(resolve))
+})
+
+
+test('accepts T3-style MCP injection with an explicit warning and never executes or forwards host tools', async () => {
+  const { phone, connection, agent, updates } = connect()
+  try {
+    await initialize(agent)
+    const result = await agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, {
+      ...workspace, mcpServers: [{ name: 't3', command: '/host/command-must-not-run', args: [], env: [{ name: 'TOKEN', value: 'DO_NOT_LEAK' }] }],
+    })
+    assert.equal(result.sessionId, 'phone-1')
+    assert.equal(phone.stored.size, 1)
+    assert.equal(phone.submissions.length, 0)
+    assert.ok(JSON.stringify(updates).includes('Client MCP servers are not connected'))
+    assert.doesNotMatch(JSON.stringify(updates), /DO_NOT_LEAK|command-must-not-run/)
+  } finally { connection.close() }
+})
+
+test('explicit prompt cancellation releases its local approval dialog without answering it', async () => {
+  class ApprovingPhone extends FakePhone {
+    override async *run(id: string, text: string, requestId: string, signal: AbortSignal) {
+      yield { type: 'approval' as const, id: 'pending', callId: 'tool', tool: 'bash', subject: 'command', reason: 'phone policy', interactive: false }
+      yield* super.run(id, text, requestId, signal)
+    }
+    async answerApproval() { assert.fail('Cancelling the prompt must not answer its approval') }
+  }
+  const phone = new ApprovingPhone()
+  const asked = Promise.withResolvers<void>()
+  const dialogClosed = Promise.withResolvers<void>()
+  const peer = acp.client().onRequest(acp.methods.client.session.requestPermission, async ({ signal }) => {
+    asked.resolve()
+    await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+    dialogClosed.resolve()
+    return { outcome: { outcome: 'cancelled' as const } }
+  })
+  const connection = peer.connect(createAdapter(phone))
+  try {
+    await initialize(connection.agent)
+    const { sessionId } = await connection.agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, workspace)
+    const prompt = connection.agent.request(acp.methods.agent.session.prompt, promptFor(sessionId))
+    await asked.promise
+    await phone.started.promise
+    await connection.agent.notify(acp.methods.agent.session.cancel, { sessionId })
+    assert.deepEqual(await prompt, { stopReason: 'cancelled' })
+    await dialogClosed.promise
+    assert.equal(phone.cancellations.length, 1)
   } finally { connection.close() }
 })
