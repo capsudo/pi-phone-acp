@@ -1,0 +1,22 @@
+{
+  "name": "pi-phone-acp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ACP adapter for a phone-owned pi-phone agent",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "2.7.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
