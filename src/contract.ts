@@ -22,6 +22,15 @@ export const entrySchema = z.object({
 }).passthrough()
 export type Entry = z.infer<typeof entrySchema>
 
+export const riskyApprovalFormSchema = z.strictObject({
+  type: z.literal('risky'),
+  control: z.string().min(1),
+  word: z.string().min(1),
+  found: z.enum(['name', 'button', 'address']),
+  where: z.string().min(1),
+  place: z.enum(['browser', 'computer']),
+})
+
 export const viewSchema = z.object({
   full: z.boolean(),
   conversation: z.object({ id, cwd: z.string() }).passthrough(),

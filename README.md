@@ -40,7 +40,7 @@ A lost submission response is an unknown outcome, not permission to retry. The a
 
 Only an explicit ACP cancellation invokes pi-phone's Stop action. **Stop is conversation-wide and also withdraws queued messages.** Transport loss, stdin EOF, process signals and approval-dialog cancellation do not invoke Stop. The phone and Android still control background survival. The adapter cannot make an Android-killed task resume exactly once.
 
-Simple phone approvals become T3 allow-once/deny-once questions. T3's permission mode may answer those questions automatically. Secret forms, interviews and other interactive approvals stay in pi-phone. The adapter does not impose a T3 sandbox on phone tools. The reported phone grants pi-phone app-wide KernelSU root access, so authenticated remote execution must be treated accordingly.
+Simple phone approvals, including native risky-action cards, become T3 allow-once/deny-once questions with the action and location shown. T3's permission mode may answer those questions automatically. This version does not forward input forms or interviews; complete those in pi-phone. T3 supports ordinary form input, but its current form handler does not provide private password fields. The adapter does not impose a T3 sandbox on phone tools. The reported phone grants pi-phone app-wide KernelSU root access, so authenticated remote execution must be treated accordingly.
 
 T3's file, terminal, Git and checkpoint panels remain on the T3 host. Client MCP servers are not executed or forwarded to Android, and the adapter reports this explicitly when T3 supplies them. Configure tools on the phone instead. Additional client workspace roots and client system prompts are refused rather than silently treated as phone configuration.
 

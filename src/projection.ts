@@ -1,4 +1,4 @@
-import type { Entry, View } from './contract.js'
+import { riskyApprovalFormSchema, type Entry, type View } from './contract.js'
 import type { PhoneEvent } from './phone.js'
 
 /** Deduplicates committed entries and tool snapshots, not unreliable SSE cursors. */
@@ -55,10 +55,14 @@ export class Projection {
       })
     }
     for (const approval of view.approvals ?? []) {
+      const risky = riskyApprovalFormSchema.safeParse(approval.form)
+      const reason = risky.success
+        ? `${approval.reason}\nAction: ${risky.data.control}\nTrigger: ${risky.data.word} (${risky.data.found})\nWhere: ${risky.data.where}\nInterface: ${risky.data.place}`
+        : approval.reason
       events.push({
         type: 'approval', id: approval.id, callId: approval.callId ?? approval.id,
-        tool: approval.tool, subject: approval.subject, reason: approval.reason,
-        interactive: approval.form !== undefined,
+        tool: approval.tool, subject: approval.subject, reason,
+        interactive: approval.form !== undefined && !risky.success,
       })
     }
     return events

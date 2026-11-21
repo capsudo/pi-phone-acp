@@ -3,6 +3,9 @@ import { test } from 'node:test'
 import * as acp from '@agentclientprotocol/sdk'
 import { createAdapter } from '../src/adapter.js'
 import type { PhoneBackend, PhoneEvent, PhoneSession } from '../src/phone.js'
+import { viewSchema } from '../src/contract.js'
+import { Projection } from '../src/projection.js'
+import { approvalView, riskyApproval, riskyForm } from './approval-fixture.js'
 
 class FakePhone implements PhoneBackend {
   readonly stored = new Map<string, PhoneSession>()
@@ -294,6 +297,68 @@ test('bridges a simple phone approval once, without inventing permanent approval
     await connection.agent.request(acp.methods.agent.session.prompt, promptFor(sessionId))
     assert.equal(requests, 1)
     assert.deepEqual(phone.answers, [{ id: 'a/1', allow: false }])
+  } finally { connection.close() }
+})
+
+for (const allow of [false, true]) {
+  test(`round-trips a native risky card through projection and ACP with ${allow ? 'allow' : 'deny'}`, async () => {
+    class RiskyPhone extends FakePhone {
+      readonly answers: { id: string, allow: boolean }[] = []
+      readonly answered = Promise.withResolvers<void>()
+      override async *run() {
+        const projection = new Projection()
+        const view = viewSchema.parse(approvalView())
+        yield* projection.consume(view)
+        yield* projection.consume(view)
+        await this.answered.promise
+        yield { type: 'end' as const, reason: 'end_turn' as const }
+      }
+      async answerApproval(id: string, approved: boolean) {
+        this.answers.push({ id, allow: approved })
+        this.answered.resolve()
+      }
+    }
+    const phone = new RiskyPhone()
+    let requests = 0
+    const peer = acp.client().onRequest(acp.methods.client.session.requestPermission, ({ params }) => {
+      requests++
+      assert.equal(params.toolCall.toolCallId, riskyApproval.callId)
+      assert.equal(params.toolCall.title, 'browser_click: Delete')
+      assert.deepEqual(params.options.map(option => option.kind), ['allow_once', 'reject_once'])
+      assert.ok(JSON.stringify(params.toolCall.content).includes(riskyForm.where))
+      assert.ok(JSON.stringify(params.toolCall.content).includes('Trigger: delete (name)'))
+      return { outcome: { outcome: 'selected' as const, optionId: allow ? 'allow' : 'deny' } }
+    })
+    const connection = peer.connect(createAdapter(phone))
+    try {
+      await initialize(connection.agent)
+      const { sessionId } = await connection.agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, workspace)
+      await connection.agent.request(acp.methods.agent.session.prompt, promptFor(sessionId))
+      assert.equal(requests, 1)
+      assert.deepEqual(phone.answers, [{ id: riskyApproval.id, allow }])
+    } finally { connection.close() }
+  })
+}
+
+test('does not expose or approve native input forms through the permission dialog', async () => {
+  class InputPhone extends FakePhone {
+    override async *run() {
+      yield* new Projection().consume(viewSchema.parse(approvalView({ type: 'secret', value: 'DO_NOT_LEAK' })))
+      yield { type: 'end' as const, reason: 'end_turn' as const }
+    }
+    async answerApproval() { assert.fail('Input forms require a supported input protocol') }
+  }
+  const updates: acp.SessionNotification[] = []
+  const peer = acp.client()
+    .onRequest(acp.methods.client.session.requestPermission, () => { assert.fail('Do not coerce input into allow/deny') })
+    .onNotification(acp.methods.client.session.update, ({ params }) => { updates.push(params) })
+  const connection = peer.connect(createAdapter(new InputPhone()))
+  try {
+    await initialize(connection.agent)
+    const { sessionId } = await connection.agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, workspace)
+    await connection.agent.request(acp.methods.agent.session.prompt, promptFor(sessionId))
+    assert.doesNotMatch(JSON.stringify(updates), /DO_NOT_LEAK/)
+    assert.ok(JSON.stringify(updates).includes('Complete it in pi-phone'))
   } finally { connection.close() }
 })
 

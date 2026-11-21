@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { viewSchema } from '../src/contract.js'
 import { Projection } from '../src/projection.js'
+import { approvalView, riskyApproval, riskyForm } from './approval-fixture.js'
 
 const snapshot = () => ({
   full: true, conversation: { id: 1, cwd: '/phone/work' }, entries: [],
@@ -39,4 +40,53 @@ test('does not reveal redacted thoughts and keeps unsupported image content visi
   const events = projection.consume(view)
   assert.ok(events.some(event => event.type === 'notice'))
   assert.equal(events.some(event => event.type === 'thought'), false)
+})
+
+test('projects native risky cards as simple approvals with the action and site context', () => {
+  for (const place of ['browser', 'computer'] as const) {
+    for (const found of ['name', 'button', 'address'] as const) {
+      const [event] = new Projection().consume(viewSchema.parse(approvalView({ ...riskyForm, place, found })))
+      assert.ok(event?.type === 'approval')
+      assert.equal(event.interactive, false)
+      assert.equal(event.id, riskyApproval.id)
+      assert.equal(event.callId, riskyApproval.callId)
+      assert.equal(event.subject, 'Delete')
+      assert.ok(event.reason.startsWith(riskyApproval.reason))
+      assert.ok(event.reason.includes(`Action: ${riskyForm.control}`))
+      assert.ok(event.reason.includes(`Trigger: delete (${found})`))
+      assert.ok(event.reason.includes(`Where: ${riskyForm.where}`))
+      assert.ok(event.reason.includes(`Interface: ${place}`))
+    }
+  }
+})
+
+test('does not treat unknown, malformed or input-bearing forms as simple risky approvals', () => {
+  const { where: _where, ...incomplete } = riskyForm
+  for (const form of [
+    null, 'risky', [], {},
+    { type: 'secret', value: 'DO_NOT_LEAK' },
+    { type: 'interview', fields: [{ value: 'DO_NOT_LEAK' }] },
+    { type: 'future', ...{ value: 'DO_NOT_LEAK' } },
+    incomplete,
+    { ...riskyForm, control: '' },
+    { ...riskyForm, where: '' },
+    { ...riskyForm, place: 'terminal' },
+    { ...riskyForm, found: 'future' },
+    { ...riskyForm, fields: [{ value: 'DO_NOT_LEAK' }] },
+  ]) {
+    const [event] = new Projection().consume(viewSchema.parse(approvalView(form)))
+    assert.ok(event?.type === 'approval')
+    assert.equal(event.interactive, true)
+    assert.equal(event.reason, riskyApproval.reason)
+    assert.doesNotMatch(JSON.stringify(event), /DO_NOT_LEAK/)
+  }
+})
+
+test('retains support for form-less simple approvals', () => {
+  const view = approvalView()
+  const { form: _form, ...approval } = view.approvals[0]!
+  const [event] = new Projection().consume(viewSchema.parse({ ...view, approvals: [approval] }))
+  assert.ok(event?.type === 'approval')
+  assert.equal(event.interactive, false)
+  assert.equal(event.reason, riskyApproval.reason)
 })
