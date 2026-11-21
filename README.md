@@ -8,9 +8,22 @@ This allows to **control a pi agent on an android phone** directly from computer
 
 ### Architecture
 
+```mermaid
+flowchart LR
+    subgraph Computer
+        ADE["ADE"]
+        Adapter["pi-phone-acp"]
+        ADE <-->|ACP| Adapter
+    end
+    subgraph Phone["Android phone"]
+        PiPhone["pi-phone<br/>Conversations · Agent · Tools"]
+    end
+    Adapter <-->|Web API over Tailscale| PiPhone
+```
+
 pi-phone manages the conversations, the agent and its tools. pi-phone-acp is just a way to display those conversations and interact with the agent remotely from an ADE.
 
-Disconnecting the ADE does not stop the agent.
+Therefore disconnecting the ADE does not stop the agent.
 
 ### Remote access
 
