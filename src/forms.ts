@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type * as acp from '@agentclientprotocol/sdk'
+import { literalSource, markdownLabel, portableMarkdown } from './markdown.js'
 
 // Source-checked against build-508 host.ts, extension-points.ts and interviews.ts.
 export const askFormSchema = z.strictObject({
@@ -54,7 +55,7 @@ export const labelOf = (option: z.infer<typeof optionSchema>) => typeof option =
 const phoneOnlyReasons = {
   schema: 'This interview has unsupported or malformed questions, fields or rich content.',
   private: 'This interview requests sensitive input without a verified private return path.',
-  media: 'This interview needs phone-only media, Markdown rendering or source-layout features.',
+  media: 'This interview needs phone-only media, Markdown rendering, local links or source-layout features.',
   draft: 'This interview already has a saved phone draft or helper conversation; it will not be replaced.',
   state: 'This interview ended or changed, or its question metadata does not match.',
 } as const
@@ -70,22 +71,24 @@ export function supportedInterview(raw: unknown, count: number): Interview {
   if (item.status !== 'waiting' || questions.filter(q => q.type !== 'info').length !== count ||
       new Set(questions.map(q => q.id)).size !== questions.length) throw new PhoneOnlyInterview('state')
   if (sensitiveInput(`${item.questions.title ?? ''}\n${item.questions.description ?? ''}`)) throw new PhoneOnlyInterview('private')
-  const unsupportedMedia = /!\[|<(?:img|iframe|video|audio|svg|script)\b|```mermaid/i
-  if (unsupportedMedia.test(`${item.questions.title ?? ''}\n${item.questions.description ?? ''}`)) throw new PhoneOnlyInterview('media')
+  const markdown = [item.questions.description ?? '']
   for (const q of questions) {
     if (q.type !== 'info' && (/^(code|token|credential)$/i.test(q.id) || sensitiveInput(`${q.id}\n${q.question}\n${q.context ?? ''}`))) throw new PhoneOnlyInterview('private')
-    if (unsupportedMedia.test(`${q.question}\n${q.context ?? ''}`)) throw new PhoneOnlyInterview('media')
+    markdown.push(q.question, q.context ?? '')
     const labels = q.options?.map(labelOf) ?? []
     if ((q.type === 'single' || q.type === 'multi') !== (labels.length > 0) || new Set(labels).size !== labels.length) throw new PhoneOnlyInterview('schema')
     const rec = q.recommended === undefined ? [] : Array.isArray(q.recommended) ? q.recommended : [q.recommended]
     if (rec.some(value => !labels.includes(value)) || (q.type === 'single' && rec.length > 1) || (q.conviction && !rec.length)) throw new PhoneOnlyInterview('schema')
     // Layout/highlight selections and active Markdown/media need the phone renderer.
     for (const content of [q.content, ...(q.options ?? []).map(o => typeof o === 'string' ? undefined : o.content)]) {
-      if (content && (content.lines !== undefined || content.highlights !== undefined || content.showSource === false ||
-          /^mermaid$/i.test(content.lang ?? '') || (/^(md|markdown)$/i.test(content.lang ?? '') &&
-            (unsupportedMedia.test(content.source) || /<[A-Za-z!/]/.test(content.source))))) throw new PhoneOnlyInterview('media')
+      if (!content) continue
+      if (content.lines !== undefined || content.highlights !== undefined) throw new PhoneOnlyInterview('media')
+      if (renderedMarkdown(content)) markdown.push(content.source)
     }
   }
+  // Validate fragments and their composition before opening any form, including references
+  // whose definitions appear in another block. Literal source and text labels are not Markdown.
+  if (markdown.some(text => !portableMarkdown(text)) || !portableMarkdown(markdown.join('\n\n'))) throw new PhoneOnlyInterview('media')
   // Never flatten attachments, helper conversations or a person's existing saved draft.
   // Recommendation-only prefills are safe to describe, but never auto-accept.
   const prefill = questions.flatMap(q => q.recommended === undefined || q.conviction === 'slight' ? [] : [{
@@ -101,20 +104,22 @@ export function formRequest(sessionId: string, toolCallId: string, message: stri
 export function askValues(form: AskForm, content: unknown): Record<string, string> {
   return z.strictObject(Object.fromEntries(form.fields.map(field => [field.name, z.string().min(1).max(4096)]))).parse(content ?? {})
 }
+// Match the phone Content renderer: showSource overrides Markdown, not other languages.
+const renderedMarkdown = (c: z.infer<typeof contentSchema>) => (c.lang === 'md' || c.lang === 'markdown') && !c.showSource
+
 export function questionText(q: Question): string {
   const blocks = [q.question, q.context]
   const content = (c: z.infer<typeof contentSchema>) => {
-    // Use a fence longer than any source fence so context cannot become active HTML/media.
-    const length = [...c.source.matchAll(/`+/g)].reduce((max, match) => Math.max(max, match[0].length + 1), 3)
-    const fence = '`'.repeat(length)
-    const source = /^(md|markdown)$/i.test(c.lang ?? '') ? c.source : `${fence}\n${c.source}\n${fence}`
-    return [c.title, c.file && `File: ${c.file}`, c.lang && `Language: ${c.lang}`, source].filter(v => v !== undefined && v !== '').join('\n')
+    const source = renderedMarkdown(c) ? c.source : literalSource(c.source)
+    return [c.title && markdownLabel(c.title), c.file && `File: ${markdownLabel(c.file)}`, c.lang && `Language: ${markdownLabel(c.lang)}`, source].filter(v => v !== undefined && v !== '').join('\n\n')
   }
   if (q.content) blocks.push(content(q.content))
   q.options?.forEach(o => {
-    if (typeof o !== 'string') blocks.push(`Option: ${o.label}${o.recommended ? ' (recommended)' : ''}${o.conviction ? ` (${o.conviction})` : ''}${o.content ? `\n${content(o.content)}` : ''}`)
+    const label = `Option: ${markdownLabel(labelOf(o))}`
+    if (typeof o === 'string') blocks.push(label)
+    else blocks.push(`${label}${o.recommended ? ' (recommended)' : ''}${o.conviction ? ` (${o.conviction})` : ''}${o.content ? `\n\n${content(o.content)}` : ''}`)
   })
-  if (q.recommended !== undefined) blocks.push(`Recommended: ${JSON.stringify(q.recommended)}${q.conviction ? ` (${q.conviction})` : ''}. Not selected automatically.`)
+  if (q.recommended !== undefined) blocks.push(`Recommended: ${markdownLabel(JSON.stringify(q.recommended))}${q.conviction ? ` (${q.conviction})` : ''}. Not selected automatically.`)
   if (q.weight) blocks.push(`Weight: ${q.weight}`)
   return blocks.filter(v => v !== undefined).join('\n\n')
 }

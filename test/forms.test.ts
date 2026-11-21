@@ -6,6 +6,7 @@ import { viewSchema } from '../src/contract.js'
 import { askFormSchema, askValues, questionAnswer, supportedInterview, type ResponseItem } from '../src/forms.js'
 import type { PhoneBackend, PhoneEvent } from '../src/phone.js'
 import { Projection } from '../src/projection.js'
+import { literalSource, markdownLabel } from '../src/markdown.js'
 
 const ask = { type: 'ask', title: 'Destination', text: 'Choose the destination name.', submit: 'Send', fields: [{ name: 'destination', label: 'Destination name', placeholder: 'A short name' }] }
 const questions = {
@@ -387,4 +388,75 @@ test('a client that advertises but rejects elicitation never causes a phone answ
   const phone = new FormsPhone()
   const h = await harness(phone, () => { throw new acp.RequestError(-32601, 'DO_NOT_LEAK') })
   try { await settleFallback(h, phone); assert.equal(h.requests.length, 1); assert.deepEqual(phone.answers, []); assert.doesNotMatch(JSON.stringify(h.updates), /DO_NOT_LEAK/) } finally { h.connection.close() }
+})
+
+test('rich context survives route, choice and note steps with exact native IDs and explicit submission', async () => {
+  const phone = new FormsPhone({ ...interviewForm, count: 1 })
+  const source = 'const password = "dummy-only";\n`````\n<img src="local">'
+  const literalMarkdown = '![literal example](local.png)\n~~~mermaid\ngraph LR; A-->B\n~~~'
+  const title = 'Rich **literal title** <example>'
+  phone.source = { questions: { title, description: '**Review** without running anything.', questions: [
+    { id: 'intro', type: 'info', question: 'Intro context.', content: { title: 'Source example', file: 'demo.ts', lang: 'ts', source } },
+    { id: 'native/review.1', type: 'single', question: 'Compare **both** approaches.', context: '[Public reference](https://example.invalid/reference)',
+      content: { source: literalMarkdown, lang: 'md', showSource: true }, options: [
+        { label: 'First', content: { source: '**Portable** option details.', lang: 'markdown' } },
+        { label: 'Second_[literal]', recommended: true, conviction: 'slight', content: { source: 'return 2', lang: 'ts' } },
+      ], recommended: 'Second_[literal]', conviction: 'slight', weight: 'critical' },
+    { id: 'outro', type: 'info', question: 'Final context.', content: { source: '| Check | Result |\n| --- | --- |\n| demo | ready |', lang: 'md' } },
+  ] }, draft: [], status: 'waiting', createdAt: 1 }
+  const replies = [{ route: 'options' }, { value: 'Second_[literal]' }, { addNote: true }, { note: 'demo-note' }, { submit: true }]
+  const respond = queued(replies)
+  const h = await harness(phone, params => {
+    if (!params.message.includes('Review answers (unlisted')) {
+      for (const block of [markdownLabel(title), '**Review** without running anything.', 'Intro context.', literalSource(source),
+        literalSource(literalMarkdown), '**Portable** option details.', literalSource('return 2'), 'Weight: critical']) {
+        assert.ok(params.message.includes(block), `Missing rich context: ${block}`)
+      }
+    } else {
+      assert.match(params.message, /Final context/)
+      assert.match(params.message, /\| demo \| ready \|/)
+    }
+    assert.deepEqual(phone.answers, [], 'No answer is sent before final confirmation')
+    return respond(params)
+  })
+  try {
+    await h.result
+    assert.equal(replies.length, 0)
+    assert.equal(h.requests.length, 5)
+    assert.deepEqual(phone.answers, [{ kind: 'interview', id: '1', callId: 'call/1', action: 'submit', draft: [
+      { id: 'native/review.1', value: { option: 'Second_[literal]', note: 'demo-note' } },
+    ] }])
+    assert.equal(phone.getCount, 2)
+    assert.doesNotMatch(JSON.stringify(h.updates), /demo-note/)
+    assert.equal(phone.stops, 0)
+  } finally { h.connection.close() }
+})
+
+test('unsupported rich content anywhere refuses the whole interview before any local form', async () => {
+  const unsupported = [
+    { description: '<details>DO_NOT_LEAK</details>' },
+    { question: '~~~mermaid\nDO_NOT_LEAK\n~~~' },
+    { context: '```html\nDO_NOT_LEAK\n```' },
+    { question: '![DO_NOT_LEAK][picture]', context: '[picture]: local.png' },
+    { content: { source: '> ![DO_NOT_LEAK](local.png)', lang: 'md' } },
+    { content: { source: 'DO_NOT_LEAK', lang: 'ts', lines: '1-2' } },
+    { options: [{ label: 'A', content: { source: '[DO_NOT_LEAK](file:///phone/file)', lang: 'markdown' } }] },
+    { media: { type: 'table', table: { headers: ['DO_NOT_LEAK'], rows: [] } } },
+  ]
+  for (const { description, ...change } of unsupported) {
+    const phone = new FormsPhone({ ...interviewForm, count: 2 })
+    phone.source = { questions: { ...(description ? { description } : {}), questions: [
+      { id: 'first', type: 'text', question: 'An otherwise supported question.' },
+      { id: 'last', type: 'single', question: 'Review?', options: ['A'], ...change },
+    ] }, draft: [], status: 'waiting', createdAt: 1 }
+    const h = await harness(phone, () => { assert.fail('Partially forwarded unsupported rich interview') })
+    try {
+      await settleFallback(h, phone)
+      assert.equal(h.requests.length, 0)
+      assert.deepEqual(phone.answers, [])
+      assert.equal(phone.stops, 0)
+      assert.match(JSON.stringify(h.updates), /phone-only media, Markdown rendering|unsupported or malformed questions, fields or rich content/)
+      assert.doesNotMatch(JSON.stringify(h.updates), /DO_NOT_LEAK/)
+    } finally { h.connection.close() }
+  }
 })

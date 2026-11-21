@@ -2,7 +2,7 @@
 
 ACP adapter connecting T3 to an existing pi-phone service over Tailscale. The phone owns conversations, tools and running tasks. Closing T3 or stopping the adapter only disconnects observation. No adb, wireless debugging, phone SSH server or phone fork is required.
 
-The implementation targets the published **build-508** interface at `c59e0ceb993dc0ded331eeb6758f86bbaed75cec`. Automated tests use source-shaped fixtures and real ACP stdio processes, not the Android APK. Live T3 validation covers native risky-action Deny and basic interview text, choice and withheld-submission flows. Native asks and code/rich context have automated coverage only; the installed phone runtime version remains unverified.
+The implementation targets the published **build-508** interface at `c59e0ceb993dc0ded331eeb6758f86bbaed75cec`. Automated tests use source-shaped fixtures and real ACP stdio processes, not the Android APK. Live T3 validation covers native risky-action Deny, basic interview text/choice/withholding, literal source snippets and portable Markdown/table/choice context. Native asks, Markdown source-display mode and unsupported-rich-content fallback have automated coverage only; the installed phone runtime version remains unverified.
 
 ## Build and configure
 

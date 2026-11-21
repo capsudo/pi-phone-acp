@@ -2,6 +2,7 @@ import { z } from 'zod'
 import * as acp from '@agentclientprotocol/sdk'
 import type { PhoneBackend, PhoneEvent } from './phone.js'
 import { askValues, formRequest, questionAnswer, questionProperties, questionText, supportedInterview, PhoneOnlyInterview, type ResponseItem } from './forms.js'
+import { markdownLabel } from './markdown.js'
 
 const responseSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('accept'), content: z.record(z.string(), z.unknown()).nullish() }),
@@ -42,7 +43,7 @@ export async function forwardInteractive(phone: PhoneBackend, id: string, item: 
   if (!phone.getInterview || !phone.answerInterview) return 'phone'
   const original = await phone.getInterview(id, form.callId, signal)
   const interview = supportedInterview(original, form.count)
-  const prefix = [interview.questions.title ?? form.title, interview.questions.description,
+  const prefix = [markdownLabel(interview.questions.title ?? form.title), interview.questions.description,
     'Do not enter passwords or one-time codes here: ordinary T3 answers are stored in history. All answers are optional: use Skip to leave a question unanswered. No defaults are selected automatically. Other and choice notes are supported. T3 trims outer whitespace. Local answers are sent only after the final Submit confirmation. Decline skips the whole interview; Cancel leaves it waiting on the phone.'].filter(Boolean).join('\n\n')
   const draft: ResponseItem[] = []
   let context: string[] = []
