@@ -302,16 +302,40 @@ for (const allow of [false, true]) test(`structured ask acceptance uses /asks, r
   assert.deepEqual(requests, [{ path: `/api/${allow ? 'asks' : 'approvals'}/ask%2Ftask%2Fcall`, body: allow ? { values: { name: 'demo' } } : { allow: false } }])
 })
 
+test('fetches separate interview questions and posts native draft/completion rather than boolean approval', async () => {
+  const requests: { path: string, body: unknown }[] = []
+  const source = { questions: { questions: [{ id: 'x', type: 'text', question: 'Feedback?' }] }, draft: [], status: 'waiting', createdAt: 1 }
+  const request: typeof fetch = async (input, init) => {
+    requests.push({ path: new URL(String(input)).pathname, body: init?.body === undefined ? undefined : JSON.parse(String(init.body)) })
+    return Response.json(init?.body === undefined ? source : { ...source, status: JSON.parse(String(init.body)).action === 'submit' ? 'completed' : 'cancelled' })
+  }
+  const phone = new HttpPhoneBackend(new PhoneHttp(new URL('http://phone.test'), 'test-only', request), '~/work')
+  const signal = AbortSignal.timeout(1000)
+  assert.deepEqual(await phone.getInterview('392', 'call/with/slashes', signal), source)
+  await phone.answerInterview('392', 'call/with/slashes', { action: 'submit', draft: [{ id: 'x', value: 'demo' }] }, signal)
+  await phone.answerInterview('392', 'call/with/slashes', { action: 'cancel' }, signal)
+  assert.deepEqual(requests, [
+    { path: '/api/c/392/interviews/call%2Fwith%2Fslashes', body: undefined },
+    { path: '/api/c/392/interviews/call%2Fwith%2Fslashes', body: { action: 'submit', draft: [{ id: 'x', value: 'demo' }] } },
+    { path: '/api/c/392/interviews/call%2Fwith%2Fslashes', body: { action: 'cancel' } },
+  ])
+})
+
 test('lost structured answer responses are not retried by the backend', async () => {
   let requests = 0
   const request: typeof fetch = async () => { requests++; throw new Error('test-only lost response') }
   const phone = new HttpPhoneBackend(new PhoneHttp(new URL('http://phone.test'), 'test-only', request), '~/work')
   await assert.rejects(phone.answerAsk('ask/1', { field: 'demo' }, AbortSignal.timeout(1000)))
   assert.equal(requests, 1)
+  await assert.rejects(phone.answerInterview('392', 'call/1', { action: 'submit', draft: [] }, AbortSignal.timeout(1000)))
+  assert.equal(requests, 2)
 })
 
 test('structured answer acknowledgements must confirm the expected outcome', async () => {
-  const request: typeof fetch = async () => Response.json({ ok: false })
-  const phone = new HttpPhoneBackend(new PhoneHttp(new URL('http://phone.test'), 'test-only', request), '~/work')
-  await assert.rejects(phone.answerAsk('ask/1', { field: 'demo' }, AbortSignal.timeout(1000)))
+  for (const result of [{ ok: false }, { status: 'cancelled' }]) {
+    const request: typeof fetch = async () => Response.json(result)
+    const phone = new HttpPhoneBackend(new PhoneHttp(new URL('http://phone.test'), 'test-only', request), '~/work')
+    if ('ok' in result) await assert.rejects(phone.answerAsk('ask/1', { field: 'demo' }, AbortSignal.timeout(1000)))
+    else await assert.rejects(phone.answerInterview('392', 'call/1', { action: 'submit', draft: [] }, AbortSignal.timeout(1000)))
+  }
 })

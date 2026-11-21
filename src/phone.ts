@@ -1,4 +1,4 @@
-import type { AskForm } from './forms.js'
+import type { AskForm, ResponseItem } from './forms.js'
 
 /** Normalized phone boundary. Durable work always remains on the phone. */
 export interface PhoneMessage {
@@ -15,7 +15,7 @@ export interface PhoneSession {
 export type PhoneEvent =
   | { type: 'text' | 'user' | 'thought' | 'notice', text: string }
   | { type: 'tool', id: string, name: string, status: 'pending' | 'in_progress' | 'completed' | 'failed', input?: unknown, output?: string }
-  | { type: 'approval', id: string, callId: string, tool: string, subject: string, reason: string, interactive: boolean, form?: AskForm }
+  | { type: 'approval', id: string, callId: string, tool: string, subject: string, reason: string, interactive: boolean, form?: AskForm | { type: 'interview', callId: string, title: string, count: number } }
   | { type: 'approval_withdrawn', id: string }
   | { type: 'end', reason: 'end_turn' | 'cancelled' | 'max_tokens' }
 
@@ -30,4 +30,6 @@ export interface PhoneBackend {
   cancel(id: string, requestId: string): Promise<void>
   answerApproval?(id: string, allow: boolean, signal: AbortSignal): Promise<void>
   answerAsk?(id: string, values: Record<string, string>, signal: AbortSignal): Promise<void>
+  getInterview?(id: string, callId: string, signal: AbortSignal): Promise<unknown>
+  answerInterview?(id: string, callId: string, answer: { action: 'submit' | 'cancel', draft?: ResponseItem[] }, signal: AbortSignal): Promise<void>
 }

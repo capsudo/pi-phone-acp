@@ -2,7 +2,7 @@
 
 ACP adapter connecting T3 to an existing pi-phone service over Tailscale. The phone owns conversations, tools and running tasks. Closing T3 or stopping the adapter only disconnects observation. No adb, wireless debugging, phone SSH server or phone fork is required.
 
-The implementation targets the published **build-508** interface at `c59e0ceb993dc0ded331eeb6758f86bbaed75cec`. Automated tests use source-shaped fixtures and real ACP stdio processes, not the Android APK. A native risky-action Deny round trip has been verified in T3. Native ask inputs have automated coverage only; the installed phone runtime version remains unverified.
+The implementation targets the published **build-508** interface at `c59e0ceb993dc0ded331eeb6758f86bbaed75cec`. Automated tests use source-shaped fixtures and real ACP stdio processes, not the Android APK. Live T3 validation covers native risky-action Deny and basic interview text, choice and withheld-submission flows. Native asks and code/rich context have automated coverage only; the installed phone runtime version remains unverified.
 
 ## Build and configure
 
@@ -40,9 +40,9 @@ A lost submission response is an unknown outcome, not permission to retry. The a
 
 Only an explicit ACP cancellation invokes pi-phone's Stop action. **Stop is conversation-wide and also withdraws queued messages.** Transport loss, stdin EOF, process signals and approval-dialog cancellation do not invoke Stop. The phone and Android still control background survival. The adapter cannot make an Android-killed task resume exactly once.
 
-Simple phone approvals, including native risky-action cards, become T3 allow-once/deny-once questions with the action and location shown. T3's permission mode may answer those questions automatically. Supported non-sensitive ask forms use structured ACP elicitation during an active T3 turn, never permission buttons. The native ask schema has named string fields, not choice fields. T3 trims outer whitespace and stores ordinary answers in history.
+Simple phone approvals, including native risky-action cards, become T3 allow-once/deny-once questions with the action and location shown. T3's permission mode may answer those questions automatically. Supported non-sensitive ask forms and text/choice interviews use structured ACP elicitation during an active T3 turn, never permission buttons. Interviews support code and portable Markdown context, Other, choice notes, explicit Skip and final Submit; defaults are described, not selected automatically. T3 trims outer whitespace and stores ordinary answers in history.
 
-Passwords, one-time codes, mixed sensitive forms and interviews remain phone-only with a notice. Reconnect replay does not open forms outside an active T3 turn. A protocol Cancel leaves an ask waiting; Decline refuses it. Global Stop is task cancellation, not form-only dismissal. Disconnect never invents an answer. See [interactive prompt mapping](docs/interactive-prompts.md) for API and validation boundaries.
+Passwords, one-time codes, mixed sensitive forms, media/image/interactive-HTML interviews and existing phone drafts remain phone-only with a notice. Reconnect replay does not open forms outside an active T3 turn. A protocol Cancel leaves a question waiting; Decline refuses an ask or skips an interview. T3 0.1.8 does not expose a form-only Cancel control: final `false` leaves an interview on the phone, while global Stop can stop phone work. Disconnect never invents an answer. See [interactive prompt mapping](docs/interactive-prompts.md) for supported content and privacy findings.
 
 The adapter does not impose a T3 sandbox on phone tools. The reported phone grants pi-phone app-wide KernelSU root access, so authenticated remote execution must be treated accordingly.
 

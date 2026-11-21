@@ -5,6 +5,7 @@ import type { Entry, View } from './contract.js'
 import { PhoneHttp, PhoneHttpError } from './http.js'
 import type { PhoneBackend, PhoneEvent, PhoneSession } from './phone.js'
 import { Projection } from './projection.js'
+import type { ResponseItem } from './forms.js'
 
 const okSchema = z.object({ ok: z.literal(true) })
 const nativeId = (id: string) => {
@@ -158,6 +159,16 @@ export class HttpPhoneBackend implements PhoneBackend {
   async answerAsk(id: string, values: Record<string, string>, signal: AbortSignal): Promise<void> {
     // Unlike /approvals, /asks validates and returns the named values to the asker.
     await this.http.json(`/api/asks/${encodeURIComponent(id)}`, okSchema, signal, { values })
+  }
+
+  async getInterview(id: string, callId: string, signal: AbortSignal): Promise<unknown> {
+    return this.http.json(`/api/c/${nativeId(id)}/interviews/${encodeURIComponent(callId)}`, z.unknown(), signal)
+  }
+
+  async answerInterview(id: string, callId: string, answer: { action: 'submit' | 'cancel', draft?: ResponseItem[] }, signal: AbortSignal): Promise<void> {
+    // The route returns the saved interview, NOT {ok:true}. Never retry a lost POST.
+    await this.http.json(`/api/c/${nativeId(id)}/interviews/${encodeURIComponent(callId)}`,
+      z.object({ status: z.literal(answer.action === 'submit' ? 'completed' : 'cancelled') }), signal, answer)
   }
 
   private async historyBefore(id: string, view: View, after: number, signal: AbortSignal): Promise<Entry[]> {

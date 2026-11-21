@@ -3,10 +3,21 @@ import { test } from 'node:test'
 import * as acp from '@agentclientprotocol/sdk'
 import { createAdapter } from '../src/adapter.js'
 import { viewSchema } from '../src/contract.js'
+import { askFormSchema, askValues, questionAnswer, supportedInterview, type ResponseItem } from '../src/forms.js'
 import type { PhoneBackend, PhoneEvent } from '../src/phone.js'
 import { Projection } from '../src/projection.js'
 
 const ask = { type: 'ask', title: 'Destination', text: 'Choose the destination name.', submit: 'Send', fields: [{ name: 'destination', label: 'Destination name', placeholder: 'A short name' }] }
+const questions = {
+  questions: { title: 'Review implementation', description: 'Consider each option.', questions: [
+    { id: 'intro', type: 'info', question: 'Read the source before choosing.', content: { source: 'const code = "example"', lang: 'ts', file: 'demo.ts' } },
+    { id: 'single', type: 'single', question: 'Select approach', options: ['A', { label: 'B', content: { source: 'return 2', lang: 'ts' } }], recommended: 'B', conviction: 'slight', weight: 'critical' },
+    { id: 'multi', type: 'multi', question: 'Select checks', options: ['typecheck', 'tests'] },
+    { id: 'text', type: 'text', question: 'Additional feedback?' },
+    { id: 'outro', type: 'info', question: 'End of review.' },
+  ] }, draft: [], status: 'waiting', createdAt: 123,
+}
+const interviewForm = { type: 'interview', callId: 'call/1', title: 'Review implementation', count: 3 }
 const view = (form: unknown) => viewSchema.parse({ full: true, conversation: { id: 1, cwd: '/phone/work' }, entries: [], live: { busy: true }, inbox: [], approvals: [{ id: 'form/1', conversationId: 1, callId: 'call/1', tool: 'ask', subject: 'Question', reason: 'Phone question', form }] })
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 
@@ -17,7 +28,10 @@ class FormsPhone implements PhoneBackend {
   extra: PhoneEvent[] = []
   wake = Promise.withResolvers<void>()
   failAnswer = false
+  getCount = 0
+  mutateBeforeSubmit = false
   stops = 0
+  source: unknown = structuredClone(questions)
   constructor(readonly form: unknown = ask) {}
   async create() { return { id: '1', history: [] } }
   async load() { return { id: '1', history: [], replay: new Projection().consume(view(this.form)) } }
@@ -47,6 +61,8 @@ class FormsPhone implements PhoneBackend {
     if (this.failAnswer) throw new Error('DO_NOT_LEAK response-body')
     this.ended.resolve()
   }
+  async getInterview() { this.getCount++; return this.mutateBeforeSubmit && this.getCount > 1 ? { ...(this.source as object), createdAt: 456 } : structuredClone(this.source) }
+  async answerInterview(id: string, callId: string, answer: { action: 'submit' | 'cancel', draft?: ResponseItem[] }) { this.answers.push({ kind: 'interview', id, callId, ...answer }); this.ended.resolve() }
   withdraw() { this.extra.push({ type: 'approval_withdrawn', id: 'form/1' }); this.wake.resolve() }
 }
 const workspace = { cwd: '/t3/project', mcpServers: [] }
@@ -161,6 +177,65 @@ test('zero-field asks require explicit completion instead of an empty auto-accep
   try { await h.result; assert.deepEqual(phone.answers, [{ kind: 'ask', id: 'form/1', values: {} }]) } finally { h.connection.close() }
 })
 
+test('text/code interviews round-trip single/multi/Other/notes/skip and explicit final completion', async () => {
+  const phone = new FormsPhone(interviewForm)
+  const replies = [{ route: 'options' }, { value: 'B' }, { addNote: true }, { note: 'Clearer' }, { route: 'options' }, { value: ['tests', 'typecheck'] }, { addNote: false }, { addNote: false }, { route: 'skip' }, { submit: true }]
+  const h = await harness(phone, queued(replies))
+  try {
+    await h.result
+    assert.equal(replies.length, 0)
+    assert.match(h.requests[0]!.message, /const code = "example"/)
+    assert.match(h.requests[0]!.message, /return 2/)
+    assert.match(h.requests[0]!.message, /Recommended: "B" \(slight\)/)
+    assert.match(h.requests.at(-1)!.message, /End of review/)
+    assert.deepEqual(phone.answers, [{ kind: 'interview', id: '1', callId: 'call/1', action: 'submit', draft: [
+      { id: 'single', value: { option: 'B', note: 'Clearer' } }, { id: 'multi', value: [{ option: 'tests' }, { option: 'typecheck' }] },
+    ] }])
+    assert.equal(phone.getCount, 2)
+  } finally { h.connection.close() }
+})
+
+test('Other and text answers retain native question IDs', async () => {
+  const phone = new FormsPhone(interviewForm)
+  const h = await harness(phone, queued([{ route: 'other' }, { value: 'C' }, { route: 'skip' }, { route: 'answer' }, { value: 'Feedback' }, { submit: true }]))
+  try {
+    await h.result
+    assert.deepEqual((phone.answers[0] as { draft: unknown }).draft, [{ id: 'single', value: { option: 'C' } }, { id: 'text', value: 'Feedback' }])
+  } finally { h.connection.close() }
+})
+
+for (const action of ['decline', 'cancel']) test(`interview ${action} preserves phone ownership and saved prefills`, async () => {
+  const phone = new FormsPhone(interviewForm)
+  const h = await harness(phone, () => ({ action }))
+  try {
+    if (action === 'cancel') await settleFallback(h, phone)
+    else await h.result
+    assert.deepEqual(phone.answers, action === 'decline' ? [{ kind: 'interview', id: '1', callId: 'call/1', action: 'cancel' }] : [])
+  } finally { h.connection.close() }
+})
+
+test('unsupported rich content, images, saved drafts, helpers and sensitive interviews are not partially forwarded', async () => {
+  const cases = [
+    { ...questions, questions: { questions: [{ id: 'photo', type: 'image', question: 'Photo?' }] } },
+    { ...questions, questions: { questions: [{ id: 'x', type: 'text', question: 'Answer?', media: { type: 'html', html: '<b>DO_NOT_LEAK</b>' } }] } },
+    { ...questions, questions: { questions: [{ id: 'x', type: 'text', question: 'Enter the one-time code' }] } },
+    { ...questions, draft: [{ id: 'text', value: 'DO_NOT_LEAK' }] },
+    { ...questions, asked: { x: [{ q: 'DO_NOT_LEAK' }] } },
+    { ...questions, status: 'timeout' },
+  ]
+  for (const source of cases) {
+    const phone = new FormsPhone(interviewForm); phone.source = source
+    const h = await harness(phone, () => { assert.fail('Unsupported interview was partially forwarded') })
+    try { await settleFallback(h, phone); assert.deepEqual(phone.answers, []); assert.doesNotMatch(JSON.stringify(h.updates) + JSON.stringify(h.requests), /DO_NOT_LEAK/) } finally { h.connection.close() }
+  }
+})
+
+test('observed phone edits invalidate an interview before submission', async () => {
+  const phone = new FormsPhone(interviewForm); phone.mutateBeforeSubmit = true
+  const h = await harness(phone, queued([{ route: 'skip' }, { route: 'skip' }, { route: 'skip' }, { submit: true }]))
+  try { await settleFallback(h, phone); assert.deepEqual(phone.answers, []) } finally { h.connection.close() }
+})
+
 test('an uncertain answer POST is attempted once, never echoed or retried', async () => {
   const phone = new FormsPhone(); phone.failAnswer = true
   const h = await harness(phone, () => ({ action: 'accept', content: { destination: 'demo' } }))
@@ -195,6 +270,14 @@ for (const action of ['disconnect', 'withdraw', 'cancel']) test(`${action} relea
     assert.deepEqual(phone.answers, [])
     assert.equal(phone.stops, action === 'cancel' ? 1 : 0)
   } finally { h.connection.close() }
+})
+
+test('validators reject duplicate IDs, options, malformed kinds and invalid native answers', () => {
+  const parsed = askFormSchema.parse(ask)
+  assert.throws(() => askValues(parsed, { destination: 'x', extra: 'x' }))
+  const q = { id: 'q', type: 'multi' as const, question: 'Choose', options: ['A', 'B'] }
+  for (const raw of [{ value: ['A', 'A'] }, { value: ['C'] }, { value: ['A'], note_1: 'Wrong selection' }, { value: 3 }]) assert.throws(() => questionAnswer(q, raw))
+  assert.throws(() => supportedInterview({ ...questions, questions: { questions: [q, q] } }, 2))
 })
 
 test('reconnect replay is observation-only when T3 has no active form turn', async () => {
@@ -255,6 +338,49 @@ for (const completion of ['answer', 'cancel', 'withdraw']) test(`async phone for
     assert.equal(phone.answers.length, completion === 'answer' ? 1 : 0)
     assert.equal(phone.stops, 0)
   } finally { h.connection.close() }
+})
+
+test('invalid interview choice is rejected before any note question or native answer', async () => {
+  const phone = new FormsPhone(interviewForm)
+  const responses = [{ route: 'options' }, { value: 'NOT_AN_OPTION' }]
+  const h = await harness(phone, queued(responses))
+  try {
+    await settleFallback(h, phone)
+    assert.equal(h.requests.length, 2)
+    assert.deepEqual(phone.answers, [])
+  } finally { h.connection.close() }
+})
+
+test('strong recommendations are shown but never silently submitted as answers', async () => {
+  const phone = new FormsPhone({ ...interviewForm, count: 1 })
+  phone.source = { questions: { questions: [{ id: 'q', type: 'single', question: 'Choose', options: ['A', 'B'], recommended: 'B', conviction: 'strong' }] }, draft: [{ id: 'q', value: { option: 'B' } }], status: 'waiting', createdAt: 1 }
+  const h = await harness(phone, queued([{ route: 'skip' }, { submit: true }]))
+  try { await h.result; assert.deepEqual((phone.answers[0] as { draft: unknown }).draft, []); assert.match(h.requests[0]!.message, /Not selected automatically/) } finally { h.connection.close() }
+})
+
+test('declining after local answers cancels without replacing the phone draft', async () => {
+  const phone = new FormsPhone(interviewForm)
+  const answers = [{ action: 'accept', content: { route: 'other' } }, { action: 'accept', content: { value: 'local-only' } }, { action: 'decline' }]
+  const h = await harness(phone, () => answers.shift())
+  try { await h.result; assert.deepEqual(phone.answers, [{ kind: 'interview', id: '1', callId: 'call/1', action: 'cancel' }]); assert.doesNotMatch(JSON.stringify(h.updates), /local-only/) } finally { h.connection.close() }
+})
+
+test('false final confirmation does not complete an interview', async () => {
+  const phone = new FormsPhone(interviewForm)
+  const h = await harness(phone, queued([{ route: 'skip' }, { route: 'skip' }, { route: 'skip' }, { submit: false }]))
+  try { await settleFallback(h, phone); assert.deepEqual(phone.answers, []) } finally { h.connection.close() }
+})
+
+test('portable Markdown and code with password identifiers are context, not secret-entry questions', () => {
+  const source = { questions: { questions: [{ id: 'review', type: 'text', question: 'Review this implementation', content: { source: 'const password = "example-only";\n```\n<img src="example">', lang: 'html' } }, { id: 'info', type: 'info', question: 'Context', content: { source: '**Portable** markdown with `code`.', lang: 'md' } }] }, draft: [], status: 'waiting', createdAt: 1 }
+  assert.equal(supportedInterview(source, 1).questions.questions.length, 2)
+})
+
+test('unknown top-level interview sensitivity markers fail closed before opening any form', async () => {
+  const phone = new FormsPhone(interviewForm)
+  phone.source = { ...questions, private: true, secretValue: 'DO_NOT_LEAK' }
+  const h = await harness(phone, () => { assert.fail('Unknown interview fields were ignored') })
+  try { await settleFallback(h, phone); assert.equal(h.requests.length, 0); assert.deepEqual(phone.answers, []); assert.doesNotMatch(JSON.stringify(h.updates), /DO_NOT_LEAK/) } finally { h.connection.close() }
 })
 
 test('a client that advertises but rejects elicitation never causes a phone answer or retry', async () => {

@@ -3,6 +3,7 @@ import { isAbsolute } from 'node:path'
 import * as acp from '@agentclientprotocol/sdk'
 import type { PhoneBackend, PhoneEvent, PhoneSession } from './phone.js'
 import { forwardInteractive } from './interactive.js'
+import { PhoneOnlyInterview } from './forms.js'
 
 class LocalError extends acp.RequestError {}
 const local = (error: acp.RequestError) => new LocalError(error.code, error.message, error.data)
@@ -97,6 +98,7 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
         attached.dialogs.set(item.id, dialog)
         const questionSignal = AbortSignal.any([signal, dialog.signal])
         attached.interactiveDialogs.add(item.id)
+        // Serialize interviews without blocking phone observation/withdrawals.
         attached.formQueue = attached.formQueue.then(async () => {
           try {
             if (questionSignal.aborted) return
@@ -104,7 +106,7 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
             if (result === 'phone' && !questionSignal.aborted) await notice(id, '[Interactive question remains on the phone. Complete it in pi-phone. No answer was sent automatically.]', client)
           } catch (error) {
             // Even validation exceptions can include answer/credential contents.
-            const reason = 'Could not forward or validate this interactive question; no automatic retry was attempted.'
+            const reason = error instanceof PhoneOnlyInterview ? error.message : 'Could not forward or validate this interactive question; no automatic retry was attempted.'
             if (!questionSignal.aborted) await notice(id, `[${reason} Complete it in pi-phone. Unsupported content, saved drafts or changed questions are not replaced.]`, client).catch(() => {})
           } finally { attached.dialogs.delete(item.id); attached.interactiveDialogs.delete(item.id) }
         })
@@ -230,6 +232,8 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
       }
       if (!terminal) throw new Error('Phone stream ended without a terminal result')
       await active.cancellation
+      // Async phone interviews may outlive the phone's model turn. Keep T3's
+      // turn open for its UI while observing withdrawals; never restart phone work.
       if (attached.interactiveDialogs.size && terminal.reason !== 'cancelled' && !active.cancelRequested) {
         active.waitingForForms = true
         startWatch(params.sessionId, attached, client)
