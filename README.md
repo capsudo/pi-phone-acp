@@ -1,12 +1,38 @@
 # pi-phone-acp
 
-ACP adapter connecting T3 to an existing pi-phone service over Tailscale. The phone owns conversations, tools and running tasks. Closing T3 or stopping the adapter only disconnects observation. No adb, wireless debugging, phone SSH server or phone fork is required.
+ACP adapter making [pi-phone](https://github.com/picassio/pi-phone) available to [ADE](# "Agentic Development Environment")s such as T3 Code, Herdr, Orca, Zed...
 
-The implementation targets the published **build-508** interface at `c59e0ceb993dc0ded331eeb6758f86bbaed75cec`. Automated tests use source-shaped fixtures and real ACP stdio processes, not the Android APK. Live T3 validation covers native risky-action Deny, basic interview text/choice/withholding, literal source snippets and portable Markdown/table/choice context. Native asks, Markdown source-display mode and unsupported-rich-content fallback have automated coverage only; the installed phone runtime version remains unverified.
+This allows to **control a pi agent on an android phone** directly from computer **in the ADE**, like any other agent.
+
+## How it works
+
+### Architecture
+
+pi-phone manages the conversations, the agent and its tools. pi-phone-acp is just a way to display those conversations and interact with the agent remotely from an ADE.
+
+Disconnecting the ADE does not stop the agent.
+
+### Remote access
+
+It reuses the API of the remote browser interface (web UI) that comes with pi-phone. **No `adb`**, **wireless debugging**, phone SSH server, etc...
+
+Both the computer running the ADE and the android phone must be on the **same Tailscale network**.
+
+## Features
+
+- **Approvals:** Allow or deny phone action requests directly from the ADE.
+- **Extension questions:** Answer questions and text-entry forms from phone extensions.
+- **Interviews:** Complete text and choice questionnaires, with multiple selections, notes, optional questions and final confirmation.
+- **Rich context:** View code snippets, formatted Markdown, tables and option descriptions alongside questions.
+- **Markdown source:** Display literal when requested (such as `**bold**` instead of rendered formatting).
+- **Secrets input:** Enter passwords and security codes in masked prompts for secret requests and browser or computer sign-in.
+- **Rich-content fallback:** Forms containing images, interactive previews or other unsupported content stay on the phone, with a notice in the ADE rather than an incomplete form.
+
+Targets the pi-phone **build-508** interface (`c59e0ceb993dc0ded331eeb6758f86bbaed75cec`); used with **T3 Code 0.1.8** (ACP v1).
 
 ## Build and configure
 
-Node.js 22 or later on Linux or macOS is required. Build on the machine that will run the adapter, normally the T3 server.
+Node.js 22 or later on Linux or macOS is required. Build on the machine that will run the adapter.
 
 ```sh
 npm ci --ignore-scripts
@@ -18,6 +44,7 @@ npm run build
 | `PI_PHONE_URL` | Explicit service origin, such as `http://PHONE:8787`. No sign-in token, path or query string. |
 | `PI_PHONE_TOKEN_FILE` | Absolute path to an owned, private regular file outside the repository containing only the device-session token. Owner-only permissions such as `0600` are required. Symlinks are refused. |
 | `PI_PHONE_CWD` | Existing local folder inside pi-phone, default `~/work`. This is not T3's project directory. |
+| `PI_PHONE_SECRET_FILES_DIR` | Optional exact canonical T3 secret-delivery directory, default `~/.t3/userdata/secrets/files`. Set explicitly for custom T3 server layouts. Private forwarding currently requires Linux. |
 
 Use a separately provisioned pi-phone device-session token from the existing sign-in flow. The adapter sends it as a Bearer token with `X-Pocket: 1`. It does not perform sign-in, store cookies, alter networking or manage provider credentials. Keep the token out of command arguments, Git, notes and `codesync/`. Only send plain HTTP through an already authorized, encrypted Tailscale connection.
 
@@ -42,11 +69,13 @@ Only an explicit ACP cancellation invokes pi-phone's Stop action. **Stop is conv
 
 Simple phone approvals, including native risky-action cards, become T3 allow-once/deny-once questions with the action and location shown. T3's permission mode may answer those questions automatically. Supported non-sensitive ask forms and text/choice interviews use structured ACP elicitation during an active T3 turn, never permission buttons. Interviews support code and portable Markdown context, Other, choice notes, explicit Skip and final Submit; defaults are described, not selected automatically. T3 trims outer whitespace and stores ordinary answers in history.
 
-Passwords, one-time codes, mixed sensitive forms, media/image/interactive-HTML interviews and existing phone drafts remain phone-only with a notice. Reconnect replay does not open forms outside an active T3 turn. A protocol Cancel leaves a question waiting; Decline refuses an ask or skips an interview. T3 0.1.8 does not expose a form-only Cancel control: final `false` leaves an interview on the phone, while global Stop can stop phone work. Disconnect never invents an answer. See [interactive prompt mapping](docs/interactive-prompts.md) for supported content and privacy findings.
+Dedicated phone secret requests and browser/computer sign-in/code cards can use T3 0.1.8 password cards during an active turn. T3 writes a private file on its server; the adapter validates, reads and removes it, collects all fields, then submits once to the matching phone endpoint. Values stay out of ordinary form answers and adapter updates. Sign-in values are not saved in phone Secrets; existing saved sign-in choices stay on the phone. Secret-store cards explicitly save in phone Settings > Secrets. T3 trims outer whitespace, and a lost file-delivery response can leave an upstream file for T3's existing cleanup. See the [private-input audit](docs/private-input-audit.md) for scope and limits.
+
+Sensitive generic asks/interviews, media/image/interactive-HTML interviews and existing phone drafts remain phone-only. Reconnect replay never opens forms outside an active turn. Ordinary protocol Decline refuses an ask or skips an interview. Private-card Decline rejects only the matching phone request without sending values, so the waiting call can finish; cancel, timeout and disconnect leave it unanswered. T3 0.1.8 has no form-only Cancel control for ordinary forms: final `false` leaves an interview on the phone, while global Stop can stop phone work. Disconnect never invents an answer. See [interactive prompt mapping](docs/interactive-prompts.md).
 
 The adapter does not impose a T3 sandbox on phone tools. The reported phone grants pi-phone app-wide KernelSU root access, so authenticated remote execution must be treated accordingly.
 
-T3's file, terminal, Git and checkpoint panels remain on the T3 host. Client MCP servers are not executed or forwarded to Android, and the adapter reports this explicitly when T3 supplies them. Configure tools on the phone instead. Additional client workspace roots and client system prompts are refused rather than silently treated as phone configuration.
+T3's file, terminal, Git and checkpoint panels remain on the T3 host. The adapter uses only the advertised `t3-code` MCP helper for private input; it does not execute other client MCP servers or forward them to Android. Configure phone tools on the phone. Additional client workspace roots and client system prompts are refused rather than silently treated as phone configuration.
 
 ## Development checks
 
