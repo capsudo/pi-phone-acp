@@ -58,6 +58,6 @@ export const createdSchema = z.object({ id })
 export const submittedSchema = z.object({ submissionId: id, requestId: z.string() })
 export const historySchema = z.array(entrySchema)
 export const helloSchema = z.object({
-  user: z.object({ id: z.string(), role: z.enum(['owner', 'guest', 'viewer']) }),
+  user: z.object({ id: z.string(), role: z.enum(['owner', 'guest', 'viewer']), team: z.boolean().optional() }),
   server: z.object({ home: z.string(), defaultCwd: z.string() }).passthrough(),
 }).passthrough()

@@ -27,6 +27,7 @@ export class PhoneFixture {
   readonly submitted = Promise.withResolvers<{ id: number, text: string, requestId: string }>()
   readonly submissions: { id: number, text: string, requestId: string }[] = []
   readonly answers: { id: string, allow: boolean }[] = []
+  readonly privateAnswers: { path: string, body: Record<string, unknown> }[] = []
   readonly acks: { session: string, ack: number }[] = []
   readonly pollers = new Map<string, Poller>()
   aborts = 0
@@ -85,6 +86,15 @@ export class PhoneFixture {
         return
       }
       const parts = url.pathname.split('/')
+      if (['browser', 'computer', 'secrets'].includes(parts[2]!) && ['asks', 'requests'].includes(parts[3]!)) {
+        const id = decodeURIComponent(parts.slice(4).join('/'))
+        const conversation = [...this.conversations.values()].find(item => item.approvals.some(approval => approval.id === id))
+        if (!conversation) return this.json(response, { ok: false }, 404)
+        this.privateAnswers.push({ path: url.pathname, body })
+        conversation.approvals = conversation.approvals.filter(approval => approval.id !== id)
+        this.finish(conversation.id, 'Private request completed; no values returned.')
+        return this.json(response, { ok: true })
+      }
       if (parts[2] === 'approvals') {
         this.answers.push({ id: decodeURIComponent(parts.slice(3).join('/')), allow: body.allow === true })
         for (const conversation of this.conversations.values()) {

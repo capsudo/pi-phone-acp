@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
-import * as acp from '@agentclientprotocol/sdk'
+import * as acp from '@agentclientprotocol/sdk/unstable'
 import type { PhoneBackend, PhoneEvent, PhoneSession } from './phone.js'
 import { forwardInteractive } from './interactive.js'
 import { PhoneOnlyInterview } from './forms.js'
+import { defaultSecretFiles, forwardPrivate } from './private-input.js'
+import type { SecretFiles } from './secret-files.js'
 
 class LocalError extends acp.RequestError {}
 const local = (error: acp.RequestError) => new LocalError(error.code, error.message, error.data)
@@ -26,10 +28,13 @@ interface AttachedSession {
   dialogs: Map<string, AbortController>
   interactiveDialogs: Set<string>
   formQueue: Promise<void>
+  privateMcp: boolean
 }
 
 /** One ACP connection. All durable session state belongs to the phone. */
-export function createAdapter(phone: PhoneBackend): acp.AgentApp {
+export function createAdapter(phone: PhoneBackend, options: { secretFiles?: SecretFiles, secretTimeoutMs?: number } = {}): acp.AgentApp {
+  const secretFiles = options.secretFiles ?? defaultSecretFiles()
+  const privateServer = (server: acp.McpServer) => 'type' in server && server.type === 'acp' && server.name === 't3-code' && server.serverId === 't3-code'
   const sessions = new Map<string, AttachedSession>()
   const loading = new Set<string>()
   const lifetime = new AbortController()
@@ -51,7 +56,7 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
   }
   const attach = (native: PhoneSession): AttachedSession => {
     if (!native.id) throw new Error('Invalid native session')
-    const attached: AttachedSession = { controller: new AbortController(), tools: new Set(), approvals: new Set(), dialogs: new Map(), interactiveDialogs: new Set(), formQueue: Promise.resolve() }
+    const attached: AttachedSession = { controller: new AbortController(), tools: new Set(), approvals: new Set(), dialogs: new Map(), interactiveDialogs: new Set(), formQueue: Promise.resolve(), privateMcp: false }
     sessions.set(native.id, attached)
     return attached
   }
@@ -84,13 +89,16 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
       }
       await send(id, known ? { sessionUpdate: 'tool_call_update', ...fields } : { sessionUpdate: 'tool_call', ...fields }, client)
     } else if (item.type === 'approval') {
-      if (attached.approvals.has(item.id)) return
+      if (attached.prompt?.cancelRequested || attached.approvals.has(item.id)) return
       attached.approvals.add(item.id)
       if (item.interactive) {
-        if (!formSupported || !item.form || !attached.prompt?.started) {
-          const reason = !formSupported ? 'This client did not advertise form support.'
-            : !attached.prompt?.started ? 'T3 needs an active prompt turn to show forms; reconnect replay is observation only.'
-              : 'This form is sensitive, unknown or malformed and has no verified supported/private input path.'
+        const privateInput = item.privateForm !== undefined
+        const supported = privateInput ? attached.privateMcp && !!phone.privateFormCurrent && !!phone.answerPrivate && !!phone.declinePrivate : formSupported
+        if (!supported || (!item.form && !privateInput) || !attached.prompt?.started) {
+          const reason = privateInput && !supported ? 'The dedicated T3 private-input helper or phone consumer is unavailable.'
+            : !privateInput && !formSupported ? 'This client did not advertise form support.'
+              : !attached.prompt?.started ? 'T3 needs an active prompt turn to show forms; reconnect replay is observation only.'
+                : 'This form is sensitive, unknown or malformed, or requires saved phone sign-in choices.'
           await notice(id, `[Phone is waiting for an interactive approval. Complete it in pi-phone. ${reason} Nothing was approved automatically.]`, client)
           return
         }
@@ -102,12 +110,17 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
         attached.formQueue = attached.formQueue.then(async () => {
           try {
             if (questionSignal.aborted) return
-            const result = await forwardInteractive(phone, id, item, client, questionSignal)
+            const result = item.privateForm
+              ? await forwardPrivate(phone, id, { ...item, privateForm: item.privateForm }, client, questionSignal, secretFiles, options.secretTimeoutMs)
+              : await forwardInteractive(phone, id, item, client, questionSignal)
             if (result === 'phone' && !questionSignal.aborted) await notice(id, '[Interactive question remains on the phone. Complete it in pi-phone. No answer was sent automatically.]', client)
           } catch (error) {
             // Even validation exceptions can include answer/credential contents.
             const reason = error instanceof PhoneOnlyInterview ? error.message : 'Could not forward or validate this interactive question; no automatic retry was attempted.'
-            if (!questionSignal.aborted) await notice(id, `[${reason} Complete it in pi-phone. Unsupported content, saved drafts or changed questions are not replaced.]`, client).catch(() => {})
+            const action = error instanceof PhoneOnlyInterview && error.reason === 'private'
+              ? 'Use a dedicated secret/sign-in prompt in pi-phone instead; do not enter credentials in this interview. No answer was sent automatically.'
+              : 'Complete it in pi-phone. Unsupported content, saved drafts or changed questions are not replaced.'
+            if (!questionSignal.aborted) await notice(id, `[${reason} ${action}]`, client).catch(() => {})
           } finally { attached.dialogs.delete(item.id); attached.interactiveDialogs.delete(item.id) }
         })
         return
@@ -179,7 +192,7 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
     return {
       protocolVersion: acp.PROTOCOL_VERSION,
       agentInfo: { name: 'pi-phone-acp', version: '0.1.0' },
-      agentCapabilities: { loadSession: true, promptCapabilities: { image: false, audio: false, embeddedContext: false } },
+      agentCapabilities: { loadSession: true, mcpCapabilities: { acp: true }, promptCapabilities: { image: false, audio: false, embeddedContext: false } },
       authMethods: [],
     }
   })
@@ -188,7 +201,8 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
     const native = await phone.create(AbortSignal.any([signal, lifetime.signal]))
     if (sessions.has(native.id)) throw new Error('Phone reused a session ID')
     const attached = attach(native)
-    if (params.mcpServers.length) await notice(native.id, '[Client MCP servers are not connected. Configure tools on the phone. Client-host commands and credentials are not forwarded to Android.]', client)
+    attached.privateMcp = params.mcpServers.some(privateServer)
+    if (params.mcpServers.some(server => !privateServer(server))) await notice(native.id, '[Client MCP servers are not connected. Configure tools on the phone. Client-host commands and credentials are not forwarded to Android.]', client)
     startWatch(native.id, attached, client)
     return { sessionId: native.id }
   }))
@@ -203,9 +217,10 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
       const native = await phone.load(params.sessionId, detached)
       if (native.id !== params.sessionId) throw new Error('Native session mismatch')
       const attached = attach(native)
+      attached.privateMcp = params.mcpServers.some(privateServer)
       const replay: readonly PhoneEvent[] = native.replay ?? native.history.map(message => ({ type: message.role === 'user' ? 'user' : 'text', text: message.text }))
       for (const item of replay) await event(native.id, attached, item, client, AbortSignal.any([attached.controller.signal, lifetime.signal]))
-      if (params.mcpServers.length) await notice(native.id, '[Client MCP servers are not connected. Configure tools on the phone. Client-host commands and credentials are not forwarded to Android.]', client)
+      if (params.mcpServers.some(server => !privateServer(server))) await notice(native.id, '[Client MCP servers are not connected. Configure tools on the phone. Client-host commands and credentials are not forwarded to Android.]', client)
       startWatch(native.id, attached, client)
       return {}
     } finally { loading.delete(params.sessionId) }
@@ -248,9 +263,11 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
     }
   }))
   app.onNotification(acp.methods.agent.session.cancel, ({ params }) => {
-    const active = sessions.get(params.sessionId)?.prompt
-    if (!active || active.cancelRequested) return
+    const attached = sessions.get(params.sessionId)
+    const active = attached?.prompt
+    if (!attached || !active || active.cancelRequested) return
     active.cancelRequested = true
+    for (const dialog of attached.dialogs.values()) dialog.abort()
     if (active.waitingForForms) { active.observer.abort(); return }
     if (!active.started) return
     active.cancellation = phone.cancel(params.sessionId, active.requestId)

@@ -1,6 +1,7 @@
 import { riskyApprovalFormSchema, type Entry, type View } from './contract.js'
 import type { PhoneEvent } from './phone.js'
 import { askFormSchema, interviewFormSchema, privateAsk } from './forms.js'
+import { supportedPrivateForm } from './private-forms.js'
 
 /** Deduplicates committed entries and tool snapshots, not unreliable SSE cursors. */
 export class Projection {
@@ -64,6 +65,7 @@ export class Projection {
       const interview = interviewFormSchema.safeParse(approval.form)
       const form = ask.success && !privateAsk(ask.data) ? ask.data
         : interview.success && (approval.callId === undefined || approval.callId === interview.data.callId) ? interview.data : undefined
+      const privateForm = supportedPrivateForm(approval.form, approval.tool)
       const risky = riskyApprovalFormSchema.safeParse(approval.form)
       const reason = risky.success
         ? `${approval.reason}\nAction: ${risky.data.control}\nTrigger: ${risky.data.word} (${risky.data.found})\nWhere: ${risky.data.where}\nInterface: ${risky.data.place}`
@@ -72,7 +74,7 @@ export class Projection {
         type: 'approval', id: approval.id, callId: approval.callId ?? approval.id,
         tool: approval.tool, subject: approval.subject, reason,
         interactive: approval.form !== undefined && !risky.success,
-        ...(form ? { form } : {}),
+        ...(form ? { form } : {}), ...(privateForm ? { privateForm } : {}),
       })
     }
     return events

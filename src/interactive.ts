@@ -1,7 +1,7 @@
 import { z } from 'zod'
-import * as acp from '@agentclientprotocol/sdk'
+import * as acp from '@agentclientprotocol/sdk/unstable'
 import type { PhoneBackend, PhoneEvent } from './phone.js'
-import { askValues, formRequest, questionAnswer, questionProperties, questionText, supportedInterview, PhoneOnlyInterview, type ResponseItem } from './forms.js'
+import { askFormSchema, interviewFormSchema, privateAsk, askValues, formRequest, questionAnswer, questionProperties, questionText, supportedInterview, PhoneOnlyInterview, type ResponseItem } from './forms.js'
 import { markdownLabel } from './markdown.js'
 
 const responseSchema = z.discriminatedUnion('action', [
@@ -22,6 +22,9 @@ export async function forwardInteractive(phone: PhoneBackend, id: string, item: 
     return responseSchema.parse(response)
   }
   if (form.type === 'ask') {
+    // Projection is not the only possible PhoneBackend. Recheck at the collection
+    // boundary: a masked field or extension-owned return path is not private.
+    if (!askFormSchema.safeParse(form).success || privateAsk(form)) return 'phone'
     if (!phone.answerAsk || !phone.answerApproval) return 'phone'
     const message = [form.title, form.text, `Submit action: ${form.submit}`, 'Do not enter passwords or one-time codes here: ordinary T3 answers are stored in history. Required text; 1–4096 characters per field. T3 trims outer whitespace. Decline refuses this phone question. Cancel leaves it waiting on the phone.'].filter(Boolean).join('\n\n')
     const properties = Object.fromEntries(form.fields.map(field => [field.name, {
@@ -40,7 +43,7 @@ export async function forwardInteractive(phone: PhoneBackend, id: string, item: 
     }
     return 'done'
   }
-  if (!phone.getInterview || !phone.answerInterview) return 'phone'
+  if (!interviewFormSchema.safeParse(form).success || !phone.getInterview || !phone.answerInterview) return 'phone'
   const original = await phone.getInterview(id, form.callId, signal)
   const interview = supportedInterview(original, form.count)
   const prefix = [markdownLabel(interview.questions.title ?? form.title), interview.questions.description,

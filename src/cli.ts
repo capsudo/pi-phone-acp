@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Readable, Writable } from 'node:stream'
-import { ndJsonStream } from '@agentclientprotocol/sdk'
+import { ndJsonStream } from '@agentclientprotocol/sdk/unstable'
 import { createAdapter } from './adapter.js'
 import { HttpPhoneBackend } from './backend.js'
 import { readConfig, readToken } from './config.js'

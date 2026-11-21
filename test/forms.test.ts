@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import * as acp from '@agentclientprotocol/sdk'
+import * as acp from '@agentclientprotocol/sdk/unstable'
 import { createAdapter } from '../src/adapter.js'
 import { viewSchema } from '../src/contract.js'
 import { askFormSchema, askValues, questionAnswer, supportedInterview, type ResponseItem } from '../src/forms.js'
@@ -169,6 +169,68 @@ test('mixed sensitive asks, OTP autocomplete and unknown fields stay entirely ph
     const phone = new FormsPhone(form)
     const h = await harness(phone, () => { assert.fail('Sensitive/unknown form was forwarded') })
     try { await settleFallback(h, phone); assert.deepEqual(phone.answers, []); assert.doesNotMatch(JSON.stringify(h.updates) + JSON.stringify(h.requests), /DO_NOT_LEAK/) } finally { h.connection.close() }
+  }
+})
+
+test('the collection boundary refuses sensitive, mixed and unknown forms even without Projection', async () => {
+  class UnprojectedPhone extends FormsPhone {
+    override async *run(): AsyncGenerator<PhoneEvent> {
+      // Exercise another backend supplying a raw normalized event, not Projection's guard.
+      yield { type: 'approval', id: 'form/1', callId: 'call/1', tool: 'ask', subject: 'Question', reason: 'Phone question',
+        interactive: true, form: this.form as NonNullable<Extract<PhoneEvent, { type: 'approval' }>['form']> }
+      await this.ended.promise
+      yield { type: 'end', reason: 'end_turn' }
+    }
+  }
+  const privateFields = [
+    { name: 'private', label: 'Private', secret: true, placeholder: 'DO_NOT_LEAK' },
+    { name: 'password', label: 'Account password' },
+    { name: 'value', label: 'Value', autocomplete: 'one-time-code' },
+    { name: 'code', label: 'Code' },
+    { name: 'value', label: 'Enter your recovery code' },
+  ]
+  for (const form of [
+    ...privateFields.map(field => ({ ...ask, fields: [...ask.fields, field] })),
+    { ...ask, title: 'Sign-in password', fields: ask.fields },
+    { ...ask, fields: [...ask.fields, { name: 'unknown', label: 'Unknown', private: true, value: 'DO_NOT_LEAK' }] },
+    { ...ask, fields: null },
+    { type: 'secret', name: 'DO_NOT_LEAK', description: 'Private' },
+    { type: 'browser', kind: 'code', fields: [{ name: 'code' }] },
+    { type: 'computer-sign-in', fields: [{ name: 'password' }] },
+    { type: 'crd-connect', machine: 'demo' },
+    { ...interviewForm, callId: '' },
+    { ...interviewForm, private: true, value: 'DO_NOT_LEAK' },
+  ]) {
+    const phone = new UnprojectedPhone(form)
+    const h = await harness(phone, () => { assert.fail('Unverified collection path was opened') })
+    try {
+      await settleFallback(h, phone)
+      assert.equal(h.requests.length, 0)
+      assert.equal(phone.getCount, 0)
+      assert.deepEqual(phone.answers, [])
+      assert.equal(phone.stops, 0)
+      assert.doesNotMatch(JSON.stringify(h.updates), /DO_NOT_LEAK/)
+    } finally { h.connection.close() }
+  }
+})
+
+test('mixed ordinary and private interviews are refused before collecting any answer', async () => {
+  for (const question of ['Enter your password', 'Enter the verification code', 'Enter your API key']) {
+    const phone = new FormsPhone({ ...interviewForm, count: 2 })
+    phone.source = { questions: { questions: [
+      { id: 'ordinary', type: 'text', question: 'An ordinary question first.' },
+      { id: 'private', type: 'text', question },
+    ] }, draft: [], status: 'waiting', createdAt: 1 }
+    const h = await harness(phone, () => { assert.fail('Mixed private interview was partially collected') })
+    try {
+      await settleFallback(h, phone)
+      assert.equal(h.requests.length, 0)
+      assert.equal(phone.getCount, 1)
+      assert.deepEqual(phone.answers, [])
+      assert.equal(phone.stops, 0)
+      assert.match(JSON.stringify(h.updates), /phone interviews save answers and return them to the model/)
+      assert.match(JSON.stringify(h.updates), /do not enter credentials in this interview/)
+    } finally { h.connection.close() }
   }
 })
 

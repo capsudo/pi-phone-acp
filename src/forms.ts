@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import type * as acp from '@agentclientprotocol/sdk'
+import type * as acp from '@agentclientprotocol/sdk/unstable'
 import { literalSource, markdownLabel, portableMarkdown } from './markdown.js'
 
 // Source-checked against build-508 host.ts, extension-points.ts and interviews.ts.
@@ -54,13 +54,13 @@ export const labelOf = (option: z.infer<typeof optionSchema>) => typeof option =
 
 const phoneOnlyReasons = {
   schema: 'This interview has unsupported or malformed questions, fields or rich content.',
-  private: 'This interview requests sensitive input without a verified private return path.',
+  private: 'This interview requests sensitive input, but phone interviews save answers and return them to the model.',
   media: 'This interview needs phone-only media, Markdown rendering, local links or source-layout features.',
   draft: 'This interview already has a saved phone draft or helper conversation; it will not be replaced.',
   state: 'This interview ended or changed, or its question metadata does not match.',
 } as const
 export class PhoneOnlyInterview extends Error {
-  constructor(reason: keyof typeof phoneOnlyReasons) { super(phoneOnlyReasons[reason]) }
+  constructor(readonly reason: keyof typeof phoneOnlyReasons) { super(phoneOnlyReasons[reason]) }
 }
 
 export function supportedInterview(raw: unknown, count: number): Interview {

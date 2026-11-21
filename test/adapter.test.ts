@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import * as acp from '@agentclientprotocol/sdk'
+import * as acp from '@agentclientprotocol/sdk/unstable'
 import { createAdapter } from '../src/adapter.js'
 import type { PhoneBackend, PhoneEvent, PhoneSession } from '../src/phone.js'
 import { viewSchema } from '../src/contract.js'
@@ -97,7 +97,7 @@ test('negotiates ACP v1 when a client prefers v2, with honest capabilities', asy
     assert.equal(result.agentCapabilities?.loadSession, true)
     assert.deepEqual(result.authMethods, [])
     assert.equal(result.agentCapabilities?.promptCapabilities?.image, false)
-    assert.equal(result.agentCapabilities?.mcpCapabilities, undefined)
+    assert.deepEqual(result.agentCapabilities?.mcpCapabilities, { acp: true })
   } finally { connection.close() }
 })
 

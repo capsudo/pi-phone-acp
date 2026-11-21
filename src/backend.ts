@@ -3,7 +3,8 @@ import { z } from 'zod'
 import { createdSchema, helloSchema, historySchema, pollSchema, submittedSchema, viewSchema } from './contract.js'
 import type { Entry, View } from './contract.js'
 import { PhoneHttp, PhoneHttpError } from './http.js'
-import type { PhoneBackend, PhoneEvent, PhoneSession } from './phone.js'
+import type { PhoneBackend, PhoneEvent, PhoneSession, PrivateApproval } from './phone.js'
+import { privateValues, supportedPrivateForm } from './private-forms.js'
 import { Projection } from './projection.js'
 import type { ResponseItem } from './forms.js'
 
@@ -159,6 +160,42 @@ export class HttpPhoneBackend implements PhoneBackend {
   async answerAsk(id: string, values: Record<string, string>, signal: AbortSignal): Promise<void> {
     // Unlike /approvals, /asks validates and returns the named values to the asker.
     await this.http.json(`/api/asks/${encodeURIComponent(id)}`, okSchema, signal, { values })
+  }
+
+  async privateFormCurrent(id: string, approval: PrivateApproval, signal: AbortSignal): Promise<boolean> {
+    const hello = await this.http.json('/api/me', helloSchema, signal)
+    if (hello.user.role !== 'owner' || hello.user.team) return false
+    const stream = this.views(nativeId(id), signal)
+    try {
+      const { value: view } = await stream.next()
+      const current = view?.approvals?.find(item => item.id === approval.id)
+      if (!current || current.tool !== approval.tool || (current.callId ?? current.id) !== approval.callId) return false
+      const form = supportedPrivateForm(current.form, current.tool)
+      return form !== undefined && JSON.stringify(form) === JSON.stringify(approval.privateForm)
+    } finally { await stream.return(undefined) }
+  }
+
+  async declinePrivate(id: string, approval: PrivateApproval, signal: AbortSignal): Promise<void> {
+    if (!await this.privateFormCurrent(id, approval, signal)) throw new Error('Private phone request changed')
+    signal.throwIfAborted()
+    // Explicit card Decline rejects only this request, never the conversation.
+    // A lost acknowledgement is uncertain; attempt the decision once only.
+    await this.answerApproval(approval.id, false, signal)
+  }
+
+  async answerPrivate(id: string, approval: PrivateApproval, values: Record<string, string>, signal: AbortSignal): Promise<void> {
+    const checked = privateValues(approval.privateForm, values)
+    // Re-read the native request immediately before its one attempted POST.
+    // Upstream has no compare-and-swap; concurrent phone edits are not supported.
+    if (!await this.privateFormCurrent(id, approval, signal)) throw new Error('Private phone request changed')
+    signal.throwIfAborted()
+    const key = encodeURIComponent(approval.id)
+    const form = approval.privateForm
+    const path = form.type === 'secret' ? `/api/secrets/requests/${key}`
+      : form.type === 'browser' ? `/api/browser/asks/${key}` : `/api/computer/asks/${key}`
+    const body = form.type === 'secret' ? { value: checked.value } : { values: checked, remember: false, useSaved: false }
+    // A lost response may mean values were filled or saved. Never resend it.
+    await this.http.json(path, okSchema, signal, body)
   }
 
   async getInterview(id: string, callId: string, signal: AbortSignal): Promise<unknown> {
