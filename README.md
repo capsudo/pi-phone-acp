@@ -70,25 +70,26 @@ node dist/cli.js
 
 After separately approving provider setup, T3 can use a **Local ACP command** with the absolute Node executable and the absolute `dist/cli.js` path as its argument. Set the environment variables on that same T3 server. Building the adapter does not install or register a provider.
 
-## Behavior and limits
+## Behavior
 
-T3 negotiates ACP v1. New ACP sessions create native phone conversations. T3 can reload those same native IDs after reconnecting. Reloading replays saved history and resumes observation of existing work without sending a replacement prompt. There is no local conversation database, automatic task restart, native-session listing or model switching. The phone's configured model and instructions apply.
+- Reconnecting restores the phone conversation and observes existing work without restarting it or sending another prompt.
+- Submissions are never retried automatically, so inspect the phone conversation and reload it before retrying an uncertain result.
+- Stop affects the whole phone conversation, including queued messages, rather than just the current input request. T3 specific?
+- Secret-store prompts values are saved in pi-phone Settings > Secrets. This is not the case for browser sign-in prompts which only fill corresponding fields. 
+- Declining a private prompt rejects only its matching phone request, while cancellation, timeout and disconnect leave it unanswered.
 
-The adapter uses authenticated long polling with acknowledged sequence numbers. If a poll session expires, it reads a fresh snapshot and fills history gaps without replaying committed output twice. Text and thoughts appear at committed message boundaries, not token by token. Tool progress and output update while work runs. Incoming ACP prompts currently support text only.
+## Limits
 
-A lost submission response is an unknown outcome, not permission to retry. The adapter never retries session creation or submission automatically. After an uncertain turn it refuses another submission until the conversation is explicitly reloaded. Inspect the phone history before retrying. Do not write to the same conversation from another client during an ACP prompt. Build 508 does not expose a submission-to-transcript mapping, so detected concurrent human writers cause an error rather than a guessed success.
+- The phone's model, instructions and tool permissions apply, and the ADE's local sandbox does not restrict phone tools.
+- Prompts support text only, and responses appear message by message rather than token by token.
+- Messages sent to the same phone conversation from another client can make the ADE turn fail because the adapter cannot reliably identify which response belongs to it.
+- After an adapter disconnection, questions still waiting on the phone must be completed there, whether they appeared in the ADE earlier or were asked while disconnected.
+- Forms with partially completed answers saved on the phone (entered text or selected choices), or with saved sign-in choices, must be completed through the phone's interface.
 
-Only an explicit ACP cancellation invokes pi-phone's Stop action. **Stop is conversation-wide and also withdraws queued messages.** Transport loss, stdin EOF, process signals and approval-dialog cancellation do not invoke Stop. The phone and Android still control background survival. The adapter cannot make an Android-killed task resume exactly once.
+### T3 Code specific
 
-Simple phone approvals, including native risky-action cards, become T3 allow-once/deny-once questions with the action and location shown. T3's permission mode may answer those questions automatically. Supported non-sensitive ask forms and text/choice interviews use structured ACP elicitation during an active T3 turn, never permission buttons. Interviews support code and portable Markdown context, Other, choice notes, explicit Skip and final Submit; defaults are described, not selected automatically. T3 trims outer whitespace and stores ordinary answers in history.
-
-Dedicated phone secret requests and browser/computer sign-in/code cards can use T3 0.1.8 password cards during an active turn. T3 writes a private file on its server; the adapter validates, reads and removes it, collects all fields, then submits once to the matching phone endpoint. Values stay out of ordinary form answers and adapter updates. Sign-in values are not saved in phone Secrets; existing saved sign-in choices stay on the phone. Secret-store cards explicitly save in phone Settings > Secrets. T3 trims outer whitespace, and a lost file-delivery response can leave an upstream file for T3's existing cleanup. See the [private-input audit](docs/private-input-audit.md) for scope and limits.
-
-Sensitive generic asks/interviews, media/image/interactive-HTML interviews and existing phone drafts remain phone-only. Reconnect replay never opens forms outside an active turn. Ordinary protocol Decline refuses an ask or skips an interview. Private-card Decline rejects only the matching phone request without sending values, so the waiting call can finish; cancel, timeout and disconnect leave it unanswered. T3 0.1.8 has no form-only Cancel control for ordinary forms: final `false` leaves an interview on the phone, while global Stop can stop phone work. Disconnect never invents an answer. See [interactive prompt mapping](docs/interactive-prompts.md).
-
-The adapter does not impose a T3 sandbox on phone tools. The reported phone grants pi-phone app-wide KernelSU root access, so authenticated remote execution must be treated accordingly.
-
-T3's file, terminal, Git and checkpoint panels remain on the T3 host. The adapter uses only the advertised `t3-code` MCP helper for private input; it does not execute other client MCP servers or forward them to Android. Configure phone tools on the phone. Additional client workspace roots and client system prompts are refused rather than silently treated as phone configuration.
+- T3 stores ordinary form answers in history and trims outer whitespace from both ordinary and private input.
+- Interrupted secret-file delivery can leave a temporary file for T3's existing cleanup.
 
 ## Development checks
 
@@ -97,5 +98,3 @@ npm run check
 npm test
 npm audit --omit=dev
 ```
-
-Tests cover submission uncertainty, cancellation, disconnects, process replacement, poll replay/expiry, compaction history, native approvals, structured form answers, unsupported/private input safeguards, credential files and stdout isolation. Automated checks do not establish live interactive rendering or the installed phone runtime version.
