@@ -1,3 +1,5 @@
+import type { AskForm } from './forms.js'
+
 /** Normalized phone boundary. Durable work always remains on the phone. */
 export interface PhoneMessage {
   role: 'user' | 'assistant'
@@ -13,7 +15,8 @@ export interface PhoneSession {
 export type PhoneEvent =
   | { type: 'text' | 'user' | 'thought' | 'notice', text: string }
   | { type: 'tool', id: string, name: string, status: 'pending' | 'in_progress' | 'completed' | 'failed', input?: unknown, output?: string }
-  | { type: 'approval', id: string, callId: string, tool: string, subject: string, reason: string, interactive: boolean }
+  | { type: 'approval', id: string, callId: string, tool: string, subject: string, reason: string, interactive: boolean, form?: AskForm }
+  | { type: 'approval_withdrawn', id: string }
   | { type: 'end', reason: 'end_turn' | 'cancelled' | 'max_tokens' }
 
 export interface PhoneBackend {
@@ -26,4 +29,5 @@ export interface PhoneBackend {
   /** Explicit user cancellation only, never transport loss or shutdown. */
   cancel(id: string, requestId: string): Promise<void>
   answerApproval?(id: string, allow: boolean, signal: AbortSignal): Promise<void>
+  answerAsk?(id: string, values: Record<string, string>, signal: AbortSignal): Promise<void>
 }

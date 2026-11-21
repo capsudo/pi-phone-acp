@@ -6,7 +6,7 @@ import { PhoneHttp, PhoneHttpError } from './http.js'
 import type { PhoneBackend, PhoneEvent, PhoneSession } from './phone.js'
 import { Projection } from './projection.js'
 
-const okSchema = z.object({ ok: z.boolean() })
+const okSchema = z.object({ ok: z.literal(true) })
 const nativeId = (id: string) => {
   if (!/^[1-9]\d*$/.test(id) || !Number.isSafeInteger(Number(id))) throw new Error('Invalid phone conversation ID')
   return id
@@ -153,6 +153,11 @@ export class HttpPhoneBackend implements PhoneBackend {
 
   async answerApproval(id: string, allow: boolean, signal: AbortSignal): Promise<void> {
     await this.http.json(`/api/approvals/${encodeURIComponent(id)}`, okSchema, signal, { allow })
+  }
+
+  async answerAsk(id: string, values: Record<string, string>, signal: AbortSignal): Promise<void> {
+    // Unlike /approvals, /asks validates and returns the named values to the asker.
+    await this.http.json(`/api/asks/${encodeURIComponent(id)}`, okSchema, signal, { values })
   }
 
   private async historyBefore(id: string, view: View, after: number, signal: AbortSignal): Promise<Entry[]> {

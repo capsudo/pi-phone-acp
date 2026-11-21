@@ -1,11 +1,13 @@
 import { riskyApprovalFormSchema, type Entry, type View } from './contract.js'
 import type { PhoneEvent } from './phone.js'
+import { askFormSchema, privateAsk } from './forms.js'
 
 /** Deduplicates committed entries and tool snapshots, not unreliable SSE cursors. */
 export class Projection {
   private readonly entries = new Set<number>()
   private readonly tools = new Map<string, string>()
   private readonly done = new Set<string>()
+  private approvals = new Map<string, string>()
   lastEntry = 0
 
   consume(view: View, history: readonly Entry[] = []): PhoneEvent[] {
@@ -54,7 +56,12 @@ export class Projection {
         ...(slot.output === undefined ? {} : { output: slot.output }),
       })
     }
+    const present = new Map((view.approvals ?? []).map(approval => [approval.id, JSON.stringify(approval)]))
+    for (const [id, previous] of this.approvals) if (present.get(id) !== previous) events.push({ type: 'approval_withdrawn', id })
+    this.approvals = present
     for (const approval of view.approvals ?? []) {
+      const ask = askFormSchema.safeParse(approval.form)
+      const form = ask.success && !privateAsk(ask.data) ? ask.data : undefined
       const risky = riskyApprovalFormSchema.safeParse(approval.form)
       const reason = risky.success
         ? `${approval.reason}\nAction: ${risky.data.control}\nTrigger: ${risky.data.word} (${risky.data.found})\nWhere: ${risky.data.where}\nInterface: ${risky.data.place}`
@@ -63,6 +70,7 @@ export class Projection {
         type: 'approval', id: approval.id, callId: approval.callId ?? approval.id,
         tool: approval.tool, subject: approval.subject, reason,
         interactive: approval.form !== undefined && !risky.success,
+        ...(form ? { form } : {}),
       })
     }
     return events

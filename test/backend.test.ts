@@ -288,3 +288,30 @@ test('approval IDs containing slashes stay within the authenticated API route', 
     assert.equal(fixture.submissions.length, 0)
   } finally { await fixture.close() }
 })
+
+for (const allow of [false, true]) test(`structured ask acceptance uses /asks, refusal uses /approvals (${allow})`, async () => {
+  const requests: { path: string, body: unknown }[] = []
+  const request: typeof fetch = async (input, init) => {
+    const url = new URL(String(input))
+    requests.push({ path: url.pathname, body: JSON.parse(String(init?.body)) })
+    return Response.json({ ok: true })
+  }
+  const phone = new HttpPhoneBackend(new PhoneHttp(new URL('http://phone.test'), 'test-only', request), '~/work')
+  if (allow) await phone.answerAsk('ask/task/call', { name: 'demo' }, AbortSignal.timeout(1000))
+  else await phone.answerApproval('ask/task/call', false, AbortSignal.timeout(1000))
+  assert.deepEqual(requests, [{ path: `/api/${allow ? 'asks' : 'approvals'}/ask%2Ftask%2Fcall`, body: allow ? { values: { name: 'demo' } } : { allow: false } }])
+})
+
+test('lost structured answer responses are not retried by the backend', async () => {
+  let requests = 0
+  const request: typeof fetch = async () => { requests++; throw new Error('test-only lost response') }
+  const phone = new HttpPhoneBackend(new PhoneHttp(new URL('http://phone.test'), 'test-only', request), '~/work')
+  await assert.rejects(phone.answerAsk('ask/1', { field: 'demo' }, AbortSignal.timeout(1000)))
+  assert.equal(requests, 1)
+})
+
+test('structured answer acknowledgements must confirm the expected outcome', async () => {
+  const request: typeof fetch = async () => Response.json({ ok: false })
+  const phone = new HttpPhoneBackend(new PhoneHttp(new URL('http://phone.test'), 'test-only', request), '~/work')
+  await assert.rejects(phone.answerAsk('ask/1', { field: 'demo' }, AbortSignal.timeout(1000)))
+})

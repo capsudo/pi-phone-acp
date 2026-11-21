@@ -2,7 +2,7 @@
 
 ACP adapter connecting T3 to an existing pi-phone service over Tailscale. The phone owns conversations, tools and running tasks. Closing T3 or stopping the adapter only disconnects observation. No adb, wireless debugging, phone SSH server or phone fork is required.
 
-The implementation targets the published **build-508** interface at `c59e0ceb993dc0ded331eeb6758f86bbaed75cec`. Automated tests use a source-shaped HTTP fixture and real ACP stdio processes, not the Android APK. The running phone runtime has not been verified. Live validation remains pending because the development Codespace cannot currently reach the phone and adapter credentials have not been provisioned.
+The implementation targets the published **build-508** interface at `c59e0ceb993dc0ded331eeb6758f86bbaed75cec`. Automated tests use source-shaped fixtures and real ACP stdio processes, not the Android APK. A native risky-action Deny round trip has been verified in T3. Native ask inputs have automated coverage only; the installed phone runtime version remains unverified.
 
 ## Build and configure
 
@@ -40,7 +40,11 @@ A lost submission response is an unknown outcome, not permission to retry. The a
 
 Only an explicit ACP cancellation invokes pi-phone's Stop action. **Stop is conversation-wide and also withdraws queued messages.** Transport loss, stdin EOF, process signals and approval-dialog cancellation do not invoke Stop. The phone and Android still control background survival. The adapter cannot make an Android-killed task resume exactly once.
 
-Simple phone approvals, including native risky-action cards, become T3 allow-once/deny-once questions with the action and location shown. T3's permission mode may answer those questions automatically. This version does not forward input forms or interviews; complete those in pi-phone. T3 supports ordinary form input, but its current form handler does not provide private password fields. The adapter does not impose a T3 sandbox on phone tools. The reported phone grants pi-phone app-wide KernelSU root access, so authenticated remote execution must be treated accordingly.
+Simple phone approvals, including native risky-action cards, become T3 allow-once/deny-once questions with the action and location shown. T3's permission mode may answer those questions automatically. Supported non-sensitive ask forms use structured ACP elicitation during an active T3 turn, never permission buttons. The native ask schema has named string fields, not choice fields. T3 trims outer whitespace and stores ordinary answers in history.
+
+Passwords, one-time codes, mixed sensitive forms and interviews remain phone-only with a notice. Reconnect replay does not open forms outside an active T3 turn. A protocol Cancel leaves an ask waiting; Decline refuses it. Global Stop is task cancellation, not form-only dismissal. Disconnect never invents an answer. See [interactive prompt mapping](docs/interactive-prompts.md) for API and validation boundaries.
+
+The adapter does not impose a T3 sandbox on phone tools. The reported phone grants pi-phone app-wide KernelSU root access, so authenticated remote execution must be treated accordingly.
 
 T3's file, terminal, Git and checkpoint panels remain on the T3 host. Client MCP servers are not executed or forwarded to Android, and the adapter reports this explicitly when T3 supplies them. Configure tools on the phone instead. Additional client workspace roots and client system prompts are refused rather than silently treated as phone configuration.
 
@@ -52,4 +56,4 @@ npm test
 npm audit --omit=dev
 ```
 
-Tests cover submission uncertainty, cancellation, disconnects, process replacement, poll replay/expiry, compaction history, approval handling, credential-file safeguards and stdout isolation. Live phone and T3-server registration checks are separate and have not been performed.
+Tests cover submission uncertainty, cancellation, disconnects, process replacement, poll replay/expiry, compaction history, native approvals, structured form answers, unsupported/private input safeguards, credential files and stdout isolation. Automated checks do not establish live interactive rendering or the installed phone runtime version.

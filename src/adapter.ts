@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import * as acp from '@agentclientprotocol/sdk'
 import type { PhoneBackend, PhoneEvent, PhoneSession } from './phone.js'
+import { forwardInteractive } from './interactive.js'
 
 class LocalError extends acp.RequestError {}
 const local = (error: acp.RequestError) => new LocalError(error.code, error.message, error.data)
@@ -13,6 +14,7 @@ interface ActivePrompt {
   cancelRequested: boolean
   observer: AbortController
   cancellation?: Promise<void>
+  waitingForForms?: boolean
 }
 interface AttachedSession {
   controller: AbortController
@@ -20,6 +22,9 @@ interface AttachedSession {
   watcher?: { controller: AbortController, done: Promise<void> }
   tools: Set<string>
   approvals: Set<string>
+  dialogs: Map<string, AbortController>
+  interactiveDialogs: Set<string>
+  formQueue: Promise<void>
 }
 
 /** One ACP connection. All durable session state belongs to the phone. */
@@ -28,6 +33,7 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
   const loading = new Set<string>()
   const lifetime = new AbortController()
   const app = acp.agent({ name: 'pi-phone-acp' })
+  let formSupported = false
 
   const safe = async <T>(action: () => Promise<T>): Promise<T> => {
     try { return await action() } catch (error) {
@@ -44,7 +50,7 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
   }
   const attach = (native: PhoneSession): AttachedSession => {
     if (!native.id) throw new Error('Invalid native session')
-    const attached: AttachedSession = { controller: new AbortController(), tools: new Set(), approvals: new Set() }
+    const attached: AttachedSession = { controller: new AbortController(), tools: new Set(), approvals: new Set(), dialogs: new Map(), interactiveDialogs: new Set(), formQueue: Promise.resolve() }
     sessions.set(native.id, attached)
     return attached
   }
@@ -62,6 +68,11 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
 
   const event = async (id: string, attached: AttachedSession, item: PhoneEvent, client: acp.AgentContext, signal: AbortSignal) => {
     if (item.type === 'end') return
+    if (item.type === 'approval_withdrawn') {
+      attached.dialogs.get(item.id)?.abort()
+      attached.dialogs.delete(item.id)
+      return
+    }
     if (item.type === 'tool') {
       const known = attached.tools.has(item.id)
       attached.tools.add(item.id)
@@ -74,10 +85,38 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
     } else if (item.type === 'approval') {
       if (attached.approvals.has(item.id)) return
       attached.approvals.add(item.id)
-      if (item.interactive || !phone.answerApproval) {
-        await notice(id, '[Phone is waiting for an interactive approval. Complete it in pi-phone. Nothing was approved automatically.]', client)
+      if (item.interactive) {
+        if (!formSupported || !item.form || !attached.prompt?.started) {
+          const reason = !formSupported ? 'This client did not advertise form support.'
+            : !attached.prompt?.started ? 'T3 needs an active prompt turn to show forms; reconnect replay is observation only.'
+              : 'This form is sensitive, unknown or malformed and has no verified supported/private input path.'
+          await notice(id, `[Phone is waiting for an interactive approval. Complete it in pi-phone. ${reason} Nothing was approved automatically.]`, client)
+          return
+        }
+        const dialog = new AbortController()
+        attached.dialogs.set(item.id, dialog)
+        const questionSignal = AbortSignal.any([signal, dialog.signal])
+        attached.interactiveDialogs.add(item.id)
+        attached.formQueue = attached.formQueue.then(async () => {
+          try {
+            if (questionSignal.aborted) return
+            const result = await forwardInteractive(phone, id, item, client, questionSignal)
+            if (result === 'phone' && !questionSignal.aborted) await notice(id, '[Interactive question remains on the phone. Complete it in pi-phone. No answer was sent automatically.]', client)
+          } catch (error) {
+            // Even validation exceptions can include answer/credential contents.
+            const reason = 'Could not forward or validate this interactive question; no automatic retry was attempted.'
+            if (!questionSignal.aborted) await notice(id, `[${reason} Complete it in pi-phone. Unsupported content, saved drafts or changed questions are not replaced.]`, client).catch(() => {})
+          } finally { attached.dialogs.delete(item.id); attached.interactiveDialogs.delete(item.id) }
+        })
         return
       }
+      if (!phone.answerApproval) {
+        await notice(id, '[Complete this approval in pi-phone.]', client)
+        return
+      }
+      const dialog = new AbortController()
+      attached.dialogs.set(item.id, dialog)
+      const approvalSignal = AbortSignal.any([signal, dialog.signal])
       // Do not block observation on a UI answer. Disconnecting cancels only the
       // local question and never sends an allow/deny to the phone.
       void (async () => {
@@ -88,15 +127,14 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
             { optionId: 'allow', name: 'Allow once', kind: 'allow_once' },
             { optionId: 'deny', name: 'Deny once', kind: 'reject_once' },
           ],
-        }, { cancellationSignal: signal, stopWaitingOnCancel: true })
-        if (signal.aborted || answer.outcome.outcome !== 'selected') return
+        }, { cancellationSignal: approvalSignal, stopWaitingOnCancel: true })
+        if (approvalSignal.aborted || answer.outcome.outcome !== 'selected') return
         const choice = answer.outcome.optionId
         if (choice !== 'allow' && choice !== 'deny') return
-        await phone.answerApproval!(item.id, choice === 'allow', signal)
+        await phone.answerApproval!(item.id, choice === 'allow', approvalSignal)
       })().catch(async () => {
-        attached.approvals.delete(item.id)
-        if (!signal.aborted) await notice(id, '[Could not resolve phone approval. Check it in pi-phone.]', client).catch(() => {})
-      })
+        if (!approvalSignal.aborted) await notice(id, '[Could not resolve phone approval. Check it in pi-phone.]', client).catch(() => {})
+      }).finally(() => attached.dialogs.delete(item.id))
     } else {
       await send(id, {
         sessionUpdate: item.type === 'user' ? 'user_message_chunk' : item.type === 'thought' ? 'agent_thought_chunk' : 'agent_message_chunk',
@@ -111,7 +149,7 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
     delete attached.watcher
   }
   const startWatch = (id: string, attached: AttachedSession, client: acp.AgentContext) => {
-    if (!phone.observe || lifetime.signal.aborted) return
+    if (!phone.observe || lifetime.signal.aborted || attached.watcher) return
     const controller = new AbortController()
     const signal = AbortSignal.any([controller.signal, attached.controller.signal, lifetime.signal])
     const done = (async () => {
@@ -121,7 +159,10 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
           await event(id, attached, item, client, signal)
         }
       } catch {
-        if (!signal.aborted) await notice(id, '[Phone observation disconnected. Reload this same conversation to reconnect. Work on the phone was not cancelled.]', client).catch(() => {})
+        if (!signal.aborted) {
+          for (const dialog of attached.dialogs.values()) dialog.abort()
+          await notice(id, '[Phone observation disconnected. Reload this same conversation to reconnect. Work on the phone was not cancelled.]', client).catch(() => {})
+        }
       }
     })()
     attached.watcher = { controller, done }
@@ -132,6 +173,7 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
   })
   app.onRequest(acp.methods.agent.initialize, ({ params }) => {
     if (params.protocolVersion < acp.PROTOCOL_VERSION) throw acp.RequestError.unsupportedProtocolVersion(params.protocolVersion, [acp.PROTOCOL_VERSION])
+    formSupported = params.clientCapabilities?.elicitation?.form != null
     return {
       protocolVersion: acp.PROTOCOL_VERSION,
       agentInfo: { name: 'pi-phone-acp', version: '0.1.0' },
@@ -180,12 +222,20 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
       detached.throwIfAborted()
       if (active.cancelRequested) return { stopReason: 'cancelled' }
       active.started = true
+      let terminal: Extract<PhoneEvent, { type: 'end' }> | undefined
       for await (const item of phone.run(params.sessionId, text, active.requestId, detached)) {
         detached.throwIfAborted()
-        if (item.type === 'end') { await active.cancellation; return { stopReason: item.reason } }
+        if (item.type === 'end') { terminal = item; break }
         await event(params.sessionId, attached, item, client, detached)
       }
-      throw new Error('Phone stream ended without a terminal result')
+      if (!terminal) throw new Error('Phone stream ended without a terminal result')
+      await active.cancellation
+      if (attached.interactiveDialogs.size && terminal.reason !== 'cancelled' && !active.cancelRequested) {
+        active.waitingForForms = true
+        startWatch(params.sessionId, attached, client)
+        while (attached.interactiveDialogs.size && !detached.aborted) await attached.formQueue
+      }
+      return { stopReason: active.cancelRequested ? 'cancelled' : terminal.reason }
     } finally {
       const keepObserving = !detached.aborted
       active.observer.abort()
@@ -197,6 +247,7 @@ export function createAdapter(phone: PhoneBackend): acp.AgentApp {
     const active = sessions.get(params.sessionId)?.prompt
     if (!active || active.cancelRequested) return
     active.cancelRequested = true
+    if (active.waitingForForms) { active.observer.abort(); return }
     if (!active.started) return
     active.cancellation = phone.cancel(params.sessionId, active.requestId)
     void active.cancellation.catch(() => active.observer.abort())

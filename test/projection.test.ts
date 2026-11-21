@@ -90,3 +90,16 @@ test('retains support for form-less simple approvals', () => {
   assert.equal(event.interactive, false)
   assert.equal(event.reason, riskyApproval.reason)
 })
+
+test('withdrawal or replacement invalidates an outstanding form without repeating the form contents', () => {
+  const projection = new Projection()
+  const original = viewSchema.parse(approvalView({ type: 'ask', title: 'Question', fields: [{ name: 'answer', label: 'Answer' }], submit: 'Send' }))
+  projection.consume(original)
+  const changed = structuredClone(original)
+  changed.approvals![0]!.form = { type: 'secret', name: 'DO_NOT_LEAK', description: 'Secret' }
+  const replacement = projection.consume(changed)
+  assert.deepEqual(replacement[0], { type: 'approval_withdrawn', id: riskyApproval.id })
+  assert.doesNotMatch(JSON.stringify(replacement), /DO_NOT_LEAK/)
+  const ended = projection.consume({ ...changed, approvals: [] })
+  assert.deepEqual(ended, [{ type: 'approval_withdrawn', id: riskyApproval.id }])
+})
