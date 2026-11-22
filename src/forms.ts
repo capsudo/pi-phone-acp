@@ -18,6 +18,7 @@ export function supportedSecretAsk(raw: unknown): AskForm | undefined {
 export const interviewFormSchema = z.strictObject({
   type: z.literal('interview'), callId: z.string().min(1), title: z.string(), count: z.number().int().nonnegative(),
 })
+export type InterviewForm = z.infer<typeof interviewFormSchema>
 
 // Input intent, not code/context blocks: displaying source code is not asking for an OTP.
 const sensitive = /password|passphrase|\bsecret\b|\botp(?:[ _-]?code)?\b|one[ _-]?time|verification[ _-]*code|security[ _-]*code|auth(?:entication)?[ _-]*code|\b2fa\b|\bmfa\b|two[ -]factor|login[ _-]*code|credential|private[ _-]*key|bearer[ _-]*token|recovery[ _-]*code|backup[ _-]*code|\btotp\b|access[ _-]*token|api[ _-]*key|\bpin(?:[ _-]?code)?\b|(?:enter|paste|type|provide)[^\n]{0,30}\bcode\b/i
@@ -58,7 +59,7 @@ export const labelOf = (option: z.infer<typeof optionSchema>) => typeof option =
 
 const phoneOnlyReasons = {
   schema: 'This interview has unsupported or malformed questions, fields or rich content.',
-  private: 'This interview requests sensitive input, but phone interviews save answers and return them to the model.',
+  private: 'This interview requests sensitive input, but the private-input helper or owner-checked phone submission is unavailable.',
   media: 'This interview needs phone-only media, Markdown rendering, local links or source-layout features.',
   draft: 'This interview already has a saved phone draft or helper conversation; it will not be replaced.',
   state: 'This interview ended or changed, or its question metadata does not match.',
@@ -67,17 +68,21 @@ export class PhoneOnlyInterview extends Error {
   constructor(readonly reason: keyof typeof phoneOnlyReasons) { super(phoneOnlyReasons[reason]) }
 }
 
-export function supportedInterview(raw: unknown, count: number): Interview {
+export function sensitiveInterview(item: Interview): boolean {
+  return sensitiveInput(`${item.questions.title ?? ''}\n${item.questions.description ?? ''}`) || item.questions.questions.some(q =>
+    q.type !== 'info' && (/^(code|token|credential)$/i.test(q.id) || sensitiveInput(`${q.id}\n${q.question}\n${q.context ?? ''}`)))
+}
+
+export function supportedInterview(raw: unknown, count: number, allowSensitive = false): Interview {
   const result = interviewSchema.safeParse(raw)
   if (!result.success) throw new PhoneOnlyInterview('schema')
   const item = result.data
   const { questions } = item.questions
   if (item.status !== 'waiting' || questions.filter(q => q.type !== 'info').length !== count ||
       new Set(questions.map(q => q.id)).size !== questions.length) throw new PhoneOnlyInterview('state')
-  if (sensitiveInput(`${item.questions.title ?? ''}\n${item.questions.description ?? ''}`)) throw new PhoneOnlyInterview('private')
+  if (!allowSensitive && sensitiveInterview(item)) throw new PhoneOnlyInterview('private')
   const markdown = [item.questions.description ?? '']
   for (const q of questions) {
-    if (q.type !== 'info' && (/^(code|token|credential)$/i.test(q.id) || sensitiveInput(`${q.id}\n${q.question}\n${q.context ?? ''}`))) throw new PhoneOnlyInterview('private')
     markdown.push(q.question, q.context ?? '')
     const labels = q.options?.map(labelOf) ?? []
     if ((q.type === 'single' || q.type === 'multi') !== (labels.length > 0) || new Set(labels).size !== labels.length) throw new PhoneOnlyInterview('schema')

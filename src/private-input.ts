@@ -61,7 +61,7 @@ async function wait<T>(pending: Promise<T>, signal: AbortSignal, late: (value: T
 }
 
 /** T3 0.1.8's connectionId-based bridge, not the SDK's newer MCP carrier. */
-class SecretCards {
+export class SecretCards {
   private connectionId: string | undefined
   private closing: Promise<void> | undefined
   constructor(private readonly client: acp.AgentContext, private readonly files: SecretFiles, private readonly signal: AbortSignal) {}

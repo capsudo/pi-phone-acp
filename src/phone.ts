@@ -1,4 +1,4 @@
-import type { AskForm, ResponseItem } from './forms.js'
+import type { AskForm, InterviewForm, ResponseItem } from './forms.js'
 import type { PrivateForm } from './private-forms.js'
 
 /** Normalized phone boundary. Durable work always remains on the phone. */
@@ -16,13 +16,16 @@ export interface PhoneSession {
 export type PhoneEvent =
   | { type: 'text' | 'user' | 'thought' | 'notice', text: string }
   | { type: 'tool', id: string, name: string, status: 'pending' | 'in_progress' | 'completed' | 'failed', input?: unknown, output?: string }
-  | { type: 'approval', id: string, callId: string, tool: string, subject: string, reason: string, interactive: boolean, form?: AskForm | { type: 'interview', callId: string, title: string, count: number }, privateForm?: PrivateForm }
+  | { type: 'approval', id: string, callId: string, tool: string, subject: string, reason: string, interactive: boolean, form?: AskForm | InterviewForm, privateForm?: PrivateForm }
   | { type: 'approval_withdrawn', id: string }
   | { type: 'end', reason: 'end_turn' | 'cancelled' | 'max_tokens' }
 
 export type PrivateApproval = Extract<PhoneEvent, { type: 'approval' }> & { privateForm: PrivateForm }
 
 export type SecretAskApproval = Extract<PhoneEvent, { type: 'approval' }> & { form: AskForm }
+
+export type InterviewApproval = Extract<PhoneEvent, { type: 'approval' }> & { form: InterviewForm }
+export type InterviewAnswer = { action: 'submit' | 'cancel', draft?: ResponseItem[] }
 
 export interface PhoneBackend {
   create(signal: AbortSignal): Promise<PhoneSession>
@@ -41,6 +44,8 @@ export interface PhoneBackend {
   privateFormCurrent?(id: string, approval: PrivateApproval, signal: AbortSignal): Promise<boolean>
   answerPrivate?(id: string, approval: PrivateApproval, values: Record<string, string>, signal: AbortSignal): Promise<void>
   declinePrivate?(id: string, approval: PrivateApproval, signal: AbortSignal): Promise<void>
+  sensitiveInterviewCurrent?(id: string, approval: InterviewApproval, original: unknown, signal: AbortSignal): Promise<boolean>
+  answerSensitiveInterview?(id: string, approval: InterviewApproval, original: unknown, answer: InterviewAnswer, signal: AbortSignal): Promise<void>
   getInterview?(id: string, callId: string, signal: AbortSignal): Promise<unknown>
   answerInterview?(id: string, callId: string, answer: { action: 'submit' | 'cancel', draft?: ResponseItem[] }, signal: AbortSignal): Promise<void>
 }

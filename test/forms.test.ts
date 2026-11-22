@@ -1,10 +1,18 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { randomBytes } from 'node:crypto'
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import * as acp from '@agentclientprotocol/sdk/unstable'
+import { HttpPhoneBackend } from '../src/backend.js'
+import { PhoneHttp } from '../src/http.js'
+import { PhoneFixture } from './fixture.js'
 import { createAdapter } from '../src/adapter.js'
 import { viewSchema } from '../src/contract.js'
-import { askFormSchema, askValues, questionAnswer, supportedInterview, type ResponseItem } from '../src/forms.js'
-import type { PhoneBackend, PhoneEvent } from '../src/phone.js'
+import { askFormSchema, askValues, questionAnswer, supportedInterview, sensitiveInterview, type ResponseItem } from '../src/forms.js'
+import type { PhoneBackend, PhoneEvent, InterviewApproval, InterviewAnswer } from '../src/phone.js'
+import { SecretFiles } from '../src/secret-files.js'
 import { Projection } from '../src/projection.js'
 import { literalSource, markdownLabel } from '../src/markdown.js'
 
@@ -32,6 +40,9 @@ class FormsPhone implements PhoneBackend {
   getCount = 0
   mutateBeforeSubmit = false
   stops = 0
+  sensitiveChecks = 0
+  ownerChanged = false
+  approvalChanged = false
   source: unknown = structuredClone(questions)
   constructor(readonly form: unknown = ask) {}
   async create() { return { id: '1', history: [] } }
@@ -64,10 +75,28 @@ class FormsPhone implements PhoneBackend {
   }
   async getInterview() { this.getCount++; return this.mutateBeforeSubmit && this.getCount > 1 ? { ...(this.source as object), createdAt: 456 } : structuredClone(this.source) }
   async answerInterview(id: string, callId: string, answer: { action: 'submit' | 'cancel', draft?: ResponseItem[] }) { this.answers.push({ kind: 'interview', id, callId, ...answer }); this.ended.resolve() }
+  async sensitiveInterviewCurrent(_id: string, _approval: InterviewApproval, original: unknown, signal: AbortSignal) {
+    signal.throwIfAborted(); this.sensitiveChecks++
+    return !this.ownerChanged && !this.approvalChanged && JSON.stringify(await this.getInterview()) === JSON.stringify(original)
+  }
+  async answerSensitiveInterview(id: string, approval: InterviewApproval, original: unknown, answer: InterviewAnswer, signal: AbortSignal) {
+    if (!await this.sensitiveInterviewCurrent(id, approval, original, signal)) throw new Error('DO_NOT_LEAK changed interview')
+    signal.throwIfAborted()
+    this.answers.push(structuredClone({ kind: 'interview', id, callId: approval.form.callId, ...answer }))
+    if (this.failAnswer) throw new Error('DO_NOT_LEAK uncertain interview POST')
+    this.ended.resolve()
+  }
   withdraw() { this.extra.push({ type: 'approval_withdrawn', id: 'form/1' }); this.wake.resolve() }
 }
 const workspace = { cwd: '/t3/project', mcpServers: [] }
-async function harness(phone: FormsPhone, responses: (params: acp.CreateElicitationRequest, signal: AbortSignal) => unknown | Promise<unknown>, support = true, notices = false) {
+interface PrivateInterviewOptions {
+  backend?: PhoneBackend
+  files: SecretFiles
+  server?: boolean
+  respond: (method: string, params: Record<string, unknown>) => unknown | Promise<unknown>
+}
+
+async function harness(phone: FormsPhone, responses: (params: acp.CreateElicitationRequest, signal: AbortSignal) => unknown | Promise<unknown>, support = true, notices = false, privateInput?: PrivateInterviewOptions) {
   const requests: acp.CreateElicitationRequest[] = []
   const updates: acp.SessionNotification[] = []
   const client = acp.client()
@@ -79,13 +108,18 @@ async function harness(phone: FormsPhone, responses: (params: acp.CreateElicitat
     })
     .onRequest(acp.methods.client.session.requestPermission, () => { assert.fail('Interactive questions must not use permission buttons') })
     .onNotification(acp.methods.client.session.update, ({ params }) => { updates.push(params) })
-  const connection = client.connect(createAdapter(phone))
+    .onNotification('*', () => {})
+    .onRequest('*', async ({ method, params }) => {
+      assert.ok(privateInput, 'Unexpected private helper request')
+      return await privateInput.respond(method, params as Record<string, unknown>)
+    })
+  const connection = client.connect(createAdapter(privateInput?.backend ?? phone, privateInput ? { secretFiles: privateInput.files, secretTimeoutMs: 1000 } : {}))
   const agent = connection.agent
   await agent.request(acp.methods.agent.initialize, { protocolVersion: 2, clientCapabilities: {
     ...(support ? { elicitation: { form: {} } } : {}),
     ...(notices ? { session: { notices: {} } } : {}),
   } })
-  const { sessionId } = await agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, workspace)
+  const { sessionId } = await agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, { ...workspace, mcpServers: privateInput && privateInput.server !== false ? [{ type: 'acp', name: 't3-code', serverId: 't3-code' }] : [] })
   const result = agent.request(acp.methods.agent.session.prompt, { sessionId, prompt: [{ type: 'text', text: 'ask' }] })
   return { connection, agent, result, requests, updates }
 }
@@ -309,8 +343,8 @@ test('mixed ordinary and private interviews are refused before collecting any an
       assert.equal(phone.getCount, 1)
       assert.deepEqual(phone.answers, [])
       assert.equal(phone.stops, 0)
-      assert.match(JSON.stringify(h.updates), /phone interviews save answers and return them to the model/)
-      assert.match(JSON.stringify(h.updates), /do not enter credentials in this interview/)
+      assert.match(JSON.stringify(h.updates), /private-input helper or owner-checked phone submission is unavailable/)
+      assert.match(JSON.stringify(h.updates), /Complete it in pi-phone/)
     } finally { h.connection.close() }
   }
 })
@@ -602,4 +636,407 @@ test('unsupported rich content anywhere refuses the whole interview before any l
       assert.doesNotMatch(JSON.stringify(h.updates), /DO_NOT_LEAK/)
     } finally { h.connection.close() }
   }
+})
+
+const credentialSource = {
+  questions: { title: 'Account details', questions: [
+    { id: 'name', type: 'text', question: 'Demo name?' },
+    { id: 'credential', type: 'text', question: 'Enter the verification code.' },
+  ] }, draft: [], status: 'waiting', createdAt: 123,
+}
+function credentialPhone(source: unknown = credentialSource, count = 2) {
+  const phone = new FormsPhone({ ...interviewForm, count })
+  phone.source = structuredClone(source)
+  return phone
+}
+async function sensitiveHarness(
+  phone: FormsPhone, controls: Parameters<typeof harness>[1],
+  answers: (index: number, save: (value: string) => Promise<unknown>) => unknown | Promise<unknown>,
+  options: { backend?: PhoneBackend, server?: boolean, directory?: string, support?: boolean, version?: string } = {},
+) {
+  const base = await mkdtemp(join(tmpdir(), 'interview-private-'))
+  const directory = join(base, 'files')
+  await mkdir(directory, { mode: 0o700 })
+  const privateRequests: { method: string, params: Record<string, unknown> }[] = []
+  let cards = 0, disconnects = 0
+  const save = async (value: string) => {
+    const file = join(directory, randomBytes(16).toString('hex'))
+    await writeFile(file, value, { mode: 0o600, flag: 'wx' })
+    const result = { status: 'saved', file }
+    return { isError: false, structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] }
+  }
+  const h = await harness(phone, controls, options.support ?? true, true, {
+    files: new SecretFiles(options.directory ?? directory), server: options.server ?? true,
+    ...(options.backend ? { backend: options.backend } : {}),
+    respond: async (method, params) => {
+      privateRequests.push({ method, params })
+      assert.equal(Object.hasOwn(params, 'sessionId'), false)
+      if (method === 'mcp/connect') return { connectionId: 'interview-private' }
+      if (method === 'mcp/disconnect') { disconnects++; return {} }
+      assert.equal(method, 'mcp/message')
+      if (params.method === 'initialize') return { protocolVersion: options.version ?? '2025-06-18', capabilities: {}, serverInfo: { name: 'Offline', version: '0' } }
+      assert.equal(params.method, 'tools/call')
+      const call = params.params as { name: string, arguments: Record<string, unknown> }
+      assert.equal(call.name, 'request_secret')
+      assert.equal(call.arguments.delivery, 'file')
+      assert.ok(typeof call.arguments.label === 'string' && call.arguments.label.trim().length > 0)
+      assert.equal(Object.hasOwn(call.arguments, 'value'), false)
+      assert.match(String(call.arguments.reason), /saved in pi-phone and returned to the phone model/)
+      return answers(cards++, save)
+    },
+  })
+  void h.result.catch(() => {})
+  return { ...h, directory, privateRequests, save, cards: () => cards, disconnects: () => disconnects,
+    close: async () => { h.connection.close(); await rm(base, { recursive: true, force: true }) } }
+}
+async function until(predicate: () => boolean | Promise<boolean>) {
+  const deadline = Date.now() + 3000
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+  assert.fail('Sensitive interview did not settle')
+}
+
+test('credential interviews privately collect text, Other and choice notes while preserving rich context, choices, skips and explicit final submission', async () => {
+  const source = { questions: { title: 'Account details', description: '**Dummy-only** interview.', questions: [
+    { id: 'intro', type: 'info', question: 'Review first.', content: { source: 'const example = "code"', lang: 'ts' } },
+    ...credentialSource.questions.questions,
+    { id: 'checks', type: 'multi', question: 'Choose checks.', options: ['Build', { label: 'Tests', content: { source: '**Test context**', lang: 'md' } }] },
+    { id: 'other', type: 'single', question: 'Choose region.', options: ['A', 'B'] },
+    { id: 'skip', type: 'text', question: 'Optional comment?' },
+    { id: 'outro', type: 'info', question: 'End of review.' },
+  ] }, draft: [], status: 'waiting', createdAt: 123 }
+  const phone = credentialPhone(source, 5)
+  const controls = [{ route: 'answer' }, { route: 'answer' }, { route: 'options' }, { value: ['Build', 'Tests'] }, { addNote: true }, { addNote: false }, { route: 'other' }, { route: 'skip' }, { submit: true }]
+  const values = ['CANARY_name', '001234', 'CANARY_note', 'CANARY_other']
+  const respond = queued(controls)
+  const h = await sensitiveHarness(phone, params => {
+    assert.deepEqual(phone.answers, [])
+    if (!params.message.includes('Review answers')) {
+      assert.match(params.message, /Dummy-only/)
+      if (params.message.includes('Choose checks')) assert.match(params.message, /Test context/)
+    }
+    return respond(params)
+  }, async (index, save) => {
+    assert.deepEqual(phone.answers, [])
+    assert.deepEqual(await readdir(h.directory), [])
+    return save(values[index]!)
+  })
+  try {
+    await h.result
+    assert.equal(controls.length, 0)
+    assert.equal(h.cards(), 4)
+    assert.equal(h.disconnects(), 1)
+    assert.equal(phone.sensitiveChecks, 2)
+    assert.equal(phone.getCount, 3)
+    assert.deepEqual(phone.answers, [{ kind: 'interview', id: '1', callId: 'call/1', action: 'submit', draft: [
+      { id: 'name', value: 'CANARY_name' }, { id: 'credential', value: '001234' },
+      { id: 'checks', value: [{ option: 'Build', note: 'CANARY_note' }, { option: 'Tests' }] }, { id: 'other', value: { option: 'CANARY_other' } },
+    ] }])
+    assert.match(h.requests.at(-1)!.message, /Answer entered/)
+    assert.match(h.requests.at(-1)!.message, /End of review/)
+    assert.deepEqual(await readdir(h.directory), [])
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.privateRequests) + JSON.stringify(h.updates), /CANARY_|001234/)
+  } finally { await h.close() }
+})
+
+for (const status of ['declined', 'cancelled', 'timed_out']) test(`credential interview ${status} after partial collection sends no partial draft`, async () => {
+  const phone = credentialPhone()
+  const h = await sensitiveHarness(phone, queued([{ route: 'answer' }, { route: 'answer' }]), (index, save) => index === 0 ? save('CANARY_partial') : {
+    isError: false, structuredContent: { status }, content: [{ type: 'text', text: JSON.stringify({ status }) }],
+  })
+  try {
+    if (status === 'declined') await h.result
+    else { await until(() => h.updates.length > 0); await settleFallback(h, phone) }
+    assert.deepEqual(phone.answers, status === 'declined' ? [{ kind: 'interview', id: '1', callId: 'call/1', action: 'cancel' }] : [])
+    assert.equal(phone.stops, 0)
+    assert.equal(h.disconnects(), 1)
+    assert.deepEqual(await readdir(h.directory), [])
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.privateRequests) + JSON.stringify(h.updates), /CANARY_/)
+  } finally { await h.close() }
+})
+
+for (const submit of [true, false]) test(`credential interview final confirmation ${submit} never copies entered values into the review`, async () => {
+  const phone = credentialPhone()
+  const h = await sensitiveHarness(phone, queued([{ route: 'answer' }, { route: 'skip' }, { submit }]), (_index, save) => save(' CANARY_exact\nvalue '))
+  try {
+    if (submit) await h.result
+    else { await until(() => h.updates.length > 0); await settleFallback(h, phone) }
+    assert.deepEqual(phone.answers, submit ? [{ kind: 'interview', id: '1', callId: 'call/1', action: 'submit', draft: [{ id: 'name', value: ' CANARY_exact\nvalue ' }] }] : [])
+    assert.match(h.requests.at(-1)!.message, /Answer entered/)
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.privateRequests) + JSON.stringify(h.updates), /CANARY_/)
+    assert.deepEqual(await readdir(h.directory), [])
+  } finally { await h.close() }
+})
+
+for (const mode of ['helper', 'forms', 'directory', 'handler', 'owner', 'approval']) test(`credential interview missing/changed ${mode} blocks the entire interview before entry`, async () => {
+  const phone = credentialPhone()
+  phone.ownerChanged = mode === 'owner'
+  phone.approvalChanged = mode === 'approval'
+  if (mode === 'handler') Object.defineProperty(phone, 'answerSensitiveInterview', { value: undefined })
+  const h = await sensitiveHarness(phone, () => { assert.fail('Blocked interview opened a form') }, () => { assert.fail('Blocked interview opened a card') }, {
+    server: mode !== 'helper', support: mode !== 'forms', ...(mode === 'directory' ? { directory: 'relative/not-allowed' } : {}),
+  })
+  try {
+    await until(() => h.updates.length > 0)
+    await settleFallback(h, phone)
+    assert.equal(h.requests.length, 0)
+    assert.equal(h.privateRequests.length, 0)
+    assert.deepEqual(phone.answers, [])
+  } finally { await h.close() }
+})
+
+for (const mode of ['owner', 'approval', 'questions', 'draft']) test(`credential interview ${mode} changes before final submission prevent a write`, async () => {
+  const phone = credentialPhone()
+  const replies = queued([{ route: 'answer' }, { route: 'skip' }, { submit: true }])
+  const h = await sensitiveHarness(phone, params => {
+    if (params.message.includes('Review answers')) {
+      if (mode === 'owner') phone.ownerChanged = true
+      else if (mode === 'approval') phone.approvalChanged = true
+      else if (mode === 'questions') phone.source = { ...credentialSource, createdAt: 456 }
+      else phone.source = { ...credentialSource, draft: [{ id: 'name', value: 'phone-edited' }] }
+    }
+    return replies(params)
+  }, (_index, save) => save('CANARY_changed'))
+  try {
+    await until(() => h.updates.length > 0)
+    await settleFallback(h, phone)
+    assert.deepEqual(phone.answers, [])
+    assert.equal(h.cards(), 1)
+    assert.equal(h.disconnects(), 1)
+    assert.deepEqual(await readdir(h.directory), [])
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.updates), /CANARY_|DO_NOT_LEAK|phone-edited/)
+  } finally { await h.close() }
+})
+
+for (const action of ['submit', 'cancel']) test(`uncertain credential interview ${action} POST is attempted once without replaying collected values`, async () => {
+  const phone = credentialPhone(); phone.failAnswer = true
+  const controls = action === 'submit' ? queued([{ route: 'answer' }, { route: 'skip' }, { submit: true }]) : queued([{ route: 'answer' }, { route: 'answer' }])
+  const h = await sensitiveHarness(phone, controls, (index, save) => action === 'cancel' && index === 1
+    ? { isError: false, structuredContent: { status: 'declined' }, content: [{ type: 'text', text: '{"status":"declined"}' }] }
+    : save('CANARY_uncertain'))
+  try {
+    await until(() => h.updates.length > 0)
+    await settleFallback(h, phone)
+    assert.equal(phone.answers.length, 1)
+    assert.equal((phone.answers[0] as { action: string }).action, action)
+    assert.equal(h.cards(), action === 'submit' ? 1 : 2)
+    assert.equal(h.disconnects(), 1)
+    assert.deepEqual(await readdir(h.directory), [])
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.privateRequests) + JSON.stringify(h.updates), /CANARY_|DO_NOT_LEAK/)
+  } finally { await h.close() }
+})
+
+for (const action of ['withdraw', 'stop', 'disconnect']) test(`credential interview ${action} stops private collection without submitting local answers`, async () => {
+  const phone = credentialPhone()
+  const waiting = Promise.withResolvers<void>()
+  const answer = Promise.withResolvers<unknown>()
+  const h = await sensitiveHarness(phone, queued([{ route: 'answer' }, { route: 'answer' }]), (index, save) => {
+    if (index === 0) return save('CANARY_partial')
+    waiting.resolve(); return answer.promise
+  })
+  try {
+    await waiting.promise
+    assert.deepEqual(await readdir(h.directory), [])
+    if (action === 'withdraw') { phone.withdraw(); await until(() => h.disconnects() === 1); phone.ended.resolve() }
+    else if (action === 'stop') await h.agent.notify(acp.methods.agent.session.cancel, { sessionId: '1' })
+    else h.connection.close()
+    await h.result.catch(error => { if (action !== 'disconnect') throw error })
+    if (action === 'disconnect') answer.resolve({ isError: true, content: [] })
+    else answer.resolve(await h.save('CANARY_late'))
+    await until(async () => (await readdir(h.directory)).length === 0)
+    assert.deepEqual(phone.answers, [])
+    assert.equal(phone.stops, action === 'stop' ? 1 : 0)
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.privateRequests) + JSON.stringify(h.updates), /CANARY_/)
+  } finally { await h.close() }
+})
+
+for (const mode of ['error', 'mismatch', 'permissions', 'empty']) test(`credential interview ${mode} delivery stops collection without ordinary sensitive entry`, async () => {
+  const phone = credentialPhone()
+  const h = await sensitiveHarness(phone, queued([{ route: 'answer' }]), async (_index, save) => {
+    const reply = await save(mode === 'empty' ? '' : 'CANARY_invalid') as { isError: boolean, structuredContent: { file: string }, content: { text: string }[] }
+    if (mode === 'error') reply.isError = true
+    if (mode === 'mismatch') reply.content[0]!.text = '{"status":"declined"}'
+    if (mode === 'permissions') await chmod(reply.structuredContent.file, 0o644)
+    return reply
+  })
+  try {
+    await until(() => h.updates.length > 0)
+    await settleFallback(h, phone)
+    assert.deepEqual(phone.answers, [])
+    assert.equal(h.requests.length, 1)
+    assert.equal(h.cards(), 1)
+    assert.deepEqual(await readdir(h.directory), [])
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.privateRequests) + JSON.stringify(h.updates), /CANARY_|ZodError|ENOENT/)
+  } finally { await h.close() }
+})
+
+test('sensitive classification does not relax schema, rich-content or saved-draft validation', async () => {
+  for (const source of [
+    { ...credentialSource, private: true },
+    { ...credentialSource, draft: [{ id: 'name', value: 'CANARY_draft' }] },
+    { ...credentialSource, asked: { credential: ['CANARY_helper'] } },
+    { ...credentialSource, questions: { questions: [...credentialSource.questions.questions, { id: 'info', type: 'info', question: '![CANARY_media](local.png)' }] } },
+  ]) {
+    const phone = credentialPhone(source)
+    const h = await sensitiveHarness(phone, () => { assert.fail('Unsupported interview opened a form') }, () => { assert.fail('Unsupported interview opened a card') })
+    try {
+      await until(() => h.updates.length > 0)
+      await settleFallback(h, phone)
+      assert.equal(h.requests.length, 0)
+      assert.equal(h.privateRequests.length, 0)
+      assert.deepEqual(phone.answers, [])
+      assert.doesNotMatch(JSON.stringify(h.updates), /CANARY_/)
+    } finally { await h.close() }
+  }
+})
+
+test('credential classification uses question intent and metadata, not literal source-code identifiers', () => {
+  assert.equal(sensitiveInterview(supportedInterview(credentialSource, 2, true)), true)
+  const source = { ...credentialSource, questions: { questions: [{ id: 'review', type: 'text', question: 'Review the code.', content: { source: 'const password = "literal";', lang: 'ts' } }] } }
+  assert.equal(sensitiveInterview(supportedInterview(source, 1, true)), false)
+})
+
+for (const uncertain of [false, true]) test(`credential interview real ACP + HTTP ${uncertain ? 'lost acknowledgement' : 'completion'} posts only the final native draft`, async () => {
+  const fixture = await new PhoneFixture().start()
+  const writes: { path: string, body: unknown }[] = []
+  let ownerChecks = 0, interviewReads = 0
+  let directory = ''
+  const request: typeof fetch = async (input, init) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/me') ownerChecks++
+    if (url.pathname === '/api/c/1/interviews/call%2F1') {
+      if (init?.method !== 'POST') { interviewReads++; return Response.json(credentialSource) }
+      assert.deepEqual(await readdir(directory), [])
+      writes.push({ path: url.pathname, body: JSON.parse(String(init.body)) })
+      if (uncertain) throw new Error('DO_NOT_LEAK uncertain CANARY_http_interview')
+      fixture.conversations.get(1)!.approvals = []
+      fixture.finish(1, 'Interview completed.')
+      return Response.json({ ...credentialSource, status: 'completed' })
+    }
+    return fetch(input, init)
+  }
+  const backend = new HttpPhoneBackend(new PhoneHttp(fixture.url, fixture.token, request), '/phone/work', 0)
+  const h = await sensitiveHarness(credentialPhone(), queued([{ route: 'answer' }, { route: 'answer' }, { submit: true }]), (index, save) => save(index ? '001234' : 'CANARY_http_interview'), { backend })
+  directory = h.directory
+  try {
+    await fixture.submitted.promise
+    const native = view({ ...interviewForm, count: 2 }).approvals![0]!
+    native.tool = 'interview'
+    fixture.conversations.get(1)!.approvals = [native]
+    fixture.publish(1)
+    if (uncertain) {
+      await until(() => h.updates.some(update => JSON.stringify(update).includes('no automatic retry')))
+      fixture.conversations.get(1)!.approvals = []
+      fixture.finish(1, 'Completed after phone inspection.')
+    }
+    await h.result
+    assert.equal(ownerChecks, 2)
+    assert.equal(interviewReads, 3)
+    assert.deepEqual(writes, [{ path: '/api/c/1/interviews/call%2F1', body: { action: 'submit', draft: [{ id: 'name', value: 'CANARY_http_interview' }, { id: 'credential', value: '001234' }] } }])
+    assert.deepEqual(fixture.answers, [])
+    assert.deepEqual(fixture.privateAnswers, [])
+    assert.equal(fixture.aborts, 0)
+    assert.deepEqual(await readdir(h.directory), [])
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.privateRequests) + JSON.stringify(h.updates), /CANARY_|001234|DO_NOT_LEAK/)
+  } finally { await h.close(); await fixture.close() }
+})
+
+test('private interview entry does not suppress the native phone result that can contain submitted answers', async () => {
+  class ResultPhone extends FormsPhone {
+    override async *run(): AsyncGenerator<PhoneEvent> {
+      yield* new Projection().consume(view(this.form))
+      await this.ended.promise
+      yield { type: 'tool', id: 'call/1', name: 'interview', status: 'completed', output: 'Native result includes CANARY_native_result.' }
+      yield { type: 'text', text: 'Native result includes CANARY_native_result.' }
+      yield { type: 'end', reason: 'end_turn' }
+    }
+  }
+  const phone = new ResultPhone({ ...interviewForm, count: 2 }); phone.source = structuredClone(credentialSource)
+  const h = await sensitiveHarness(phone, queued([{ route: 'answer' }, { route: 'skip' }, { submit: true }]), (_index, save) => save('CANARY_native_result'))
+  try {
+    await h.result
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.privateRequests), /CANARY_native_result/)
+    assert.ok(h.updates.some(item => item.update.sessionUpdate === 'agent_message_chunk' && item.update.content.type === 'text' && item.update.content.text === 'Native result includes CANARY_native_result.'))
+  } finally { await h.close() }
+})
+
+test('a mismatched private-helper protocol leaves a credential interview on the phone before any entry', async () => {
+  const phone = credentialPhone()
+  const h = await sensitiveHarness(phone, () => { assert.fail('No controls after failed private setup') }, () => { assert.fail('No card after failed private setup') }, { version: 'future' })
+  try {
+    await until(() => h.updates.length > 0)
+    await settleFallback(h, phone)
+    assert.deepEqual(phone.answers, [])
+    assert.equal(h.requests.length, 0)
+    assert.equal(h.cards(), 0)
+    assert.equal(h.disconnects(), 1)
+  } finally { await h.close() }
+})
+
+test('credential interview replay outside an active prompt does not open controls or password cards', async () => {
+  const phone = credentialPhone()
+  const h = await sensitiveHarness(phone, queued([{ route: 'skip' }, { route: 'skip' }, { submit: true }]), () => { assert.fail('Skipped questions need no card') })
+  try {
+    await h.result
+    const count = h.requests.length + h.privateRequests.length
+    await h.agent.request(acp.methods.agent.session.load, { ...workspace, mcpServers: [{ type: 'acp', name: 't3-code', serverId: 't3-code' }], sessionId: '1' })
+    assert.equal(h.requests.length + h.privateRequests.length, count)
+    assert.equal(phone.answers.length, 1)
+    assert.deepEqual(phone.answers[0], { kind: 'interview', id: '1', callId: 'call/1', action: 'submit', draft: [] })
+    assert.match(JSON.stringify(h.updates), /active prompt turn/)
+  } finally { await h.close() }
+})
+
+for (const completion of ['answer', 'cancel']) test(`asynchronous credential interview keeps the ACP turn open until ${completion} without restarting phone work`, async () => {
+  class AsyncCredentialPhone extends FormsPhone {
+    override async *run(): AsyncGenerator<PhoneEvent> {
+      yield* new Projection().consume(view(this.form))
+      yield { type: 'end', reason: 'end_turn' }
+    }
+    async *observe(_id: string, signal: AbortSignal): AsyncGenerator<PhoneEvent> {
+      const abort = () => this.wake.resolve()
+      signal.addEventListener('abort', abort, { once: true })
+      try {
+        while (!signal.aborted) {
+          yield* this.extra.splice(0)
+          await this.wake.promise
+          this.wake = Promise.withResolvers<void>()
+        }
+      } finally { signal.removeEventListener('abort', abort) }
+    }
+  }
+  const phone = new AsyncCredentialPhone({ ...interviewForm, count: 2 }); phone.source = structuredClone(credentialSource)
+  const waiting = Promise.withResolvers<void>()
+  const answer = Promise.withResolvers<unknown>()
+  const h = await sensitiveHarness(phone, queued([{ route: 'answer' }, { route: 'skip' }, { submit: true }]), () => { waiting.resolve(); return answer.promise })
+  let finished = false
+  void h.result.then(() => { finished = true })
+  try {
+    await waiting.promise
+    assert.equal(finished, false)
+    if (completion === 'answer') answer.resolve(await h.save('CANARY_async'))
+    else await h.agent.notify(acp.methods.agent.session.cancel, { sessionId: '1' })
+    assert.deepEqual(await h.result, { stopReason: completion === 'answer' ? 'end_turn' : 'cancelled' })
+    if (completion === 'cancel') {
+      answer.resolve(await h.save('CANARY_late_async'))
+      await until(async () => (await readdir(h.directory)).length === 0)
+    }
+    assert.equal(phone.answers.length, completion === 'answer' ? 1 : 0)
+    assert.equal(phone.stops, 0)
+    assert.equal(h.disconnects(), 1)
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.privateRequests) + JSON.stringify(h.updates), /CANARY_/)
+  } finally { await h.close() }
+})
+
+test('credential questions without a visible title still have a nonempty password-card label', async () => {
+  const phone = credentialPhone({ ...credentialSource, questions: { questions: [{ id: 'password', type: 'text', question: '' }] } }, 1)
+  const h = await sensitiveHarness(phone, queued([{ route: 'answer' }, { submit: true }]), (_index, save) => save('CANARY_empty_title'))
+  try {
+    await h.result
+    const card = h.privateRequests.find(request => request.params.method === 'tools/call')!
+    assert.equal((card.params.params as { arguments: { label: string } }).arguments.label, 'Interview answer')
+    assert.equal(phone.answers.length, 1)
+  } finally { await h.close() }
 })

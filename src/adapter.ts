@@ -122,16 +122,16 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
             const result = item.privateForm
               ? await forwardPrivate(phone, id, { ...item, privateForm: item.privateForm }, client, questionSignal, secretFiles, options.secretTimeoutMs)
               : secretAsk ? await forwardSecretAsk(phone, id, { ...item, form: secretAsk }, client, questionSignal, secretFiles, options.secretTimeoutMs)
-                : await forwardInteractive(phone, id, item, client, questionSignal)
+                : await forwardInteractive(phone, id, item, client, questionSignal, { privateMcp: attached.privateMcp, secretFiles, secretTimeoutMs: options.secretTimeoutMs })
             if (result === 'phone' && !questionSignal.aborted) await notice(id, '[Interactive question remains on the phone. Complete it in pi-phone. No answer was sent automatically.]', client, 'Complete this question in pi-phone')
           } catch (error) {
             // Even validation exceptions can include answer/credential contents.
             const reason = error instanceof PhoneOnlyInterview ? error.message : 'Could not forward or validate this interactive question; no automatic retry was attempted.'
             const action = error instanceof PhoneOnlyInterview && error.reason === 'private'
-              ? 'Use a dedicated secret/sign-in prompt in pi-phone instead; do not enter credentials in this interview. No answer was sent automatically.'
+              ? 'Complete it in pi-phone. No answer was sent automatically.'
               : 'Complete it in pi-phone. Unsupported content, saved drafts or changed questions are not replaced.'
             const title = error instanceof PhoneOnlyInterview
-              ? error.reason === 'private' ? 'Use a dedicated private prompt in pi-phone' : 'Complete this interview in pi-phone'
+              ? 'Complete this interview in pi-phone'
               : 'Check this question in pi-phone'
             if (!questionSignal.aborted) await notice(id, `[${reason} ${action}]`, client, title).catch(() => {})
           } finally { attached.dialogs.delete(item.id); attached.interactiveDialogs.delete(item.id) }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { askValues, supportedSecretAsk } from '../src/forms.js'
-import type { SecretAskApproval } from '../src/phone.js'
+import type { SecretAskApproval, InterviewApproval, InterviewAnswer } from '../src/phone.js'
 import { privateFields, privateValues, supportedPrivateForm } from '../src/private-forms.js'
 import { Projection } from '../src/projection.js'
 import { browserCode, browserLogin, computerLogin, storeSecret, privateCases, privateView, privateApproval } from './private-fixture.js'
@@ -9,16 +9,18 @@ import { HttpPhoneBackend } from '../src/backend.js'
 import { PhoneHttp } from '../src/http.js'
 
 function httpFixture(form: unknown = browserCode, tool = 'browser_ask_code') {
-  const state = { view: privateView(form, tool), role: 'owner', team: false, fail: false, posts: [] as { path: string, body: unknown }[] }
+  const state = { view: privateView(form, tool), role: 'owner', team: false, fail: false, interview: undefined as unknown, posts: [] as { path: string, body: unknown }[] }
   const request: typeof fetch = async (input, init) => {
     const url = new URL(String(input))
     if (url.pathname === '/api/me') return Response.json({ user: { id: 'owner', role: state.role, team: state.team }, server: { home: '/phone/home', defaultCwd: '/phone/home/work' } })
     if (url.pathname === '/api/poll') return Response.json(url.searchParams.has('close') ? { ok: true } : {
       session: 'private-test-poll', events: [{ seq: 1, event: 'view', data: state.view }],
     })
+    if (url.pathname.includes('/interviews/') && init?.method !== 'POST') return Response.json(state.interview)
     assert.equal(init?.method, 'POST')
     state.posts.push({ path: url.pathname, body: JSON.parse(String(init?.body)) })
     if (state.fail) throw new Error('DO_NOT_LEAK native result or request')
+    if (url.pathname.includes('/interviews/')) return Response.json({ status: JSON.parse(String(init?.body)).action === 'cancel' ? 'cancelled' : 'completed' })
     return Response.json({ ok: true })
   }
   const phone = new HttpPhoneBackend(new PhoneHttp(new URL('http://fixture.invalid'), 'dummy-only-token', request), '~/work')
@@ -212,4 +214,101 @@ for (const decline of [false, true]) test(`secret extension ${decline ? 'Decline
   const signal = new AbortController().signal
   await assert.rejects(decline ? phone.declineSecretAsk('1', item, signal) : phone.answerSecretAsk('1', item, { account: 'dummy', key: '001234' }, signal))
   assert.deepEqual(state.posts, [{ path: `/api/${decline ? 'approvals' : 'asks'}/extension%2Frequest%2F1`, body: decline ? { allow: false } : { values: { account: 'dummy', key: '001234' } } }])
+})
+
+const sensitiveSource = {
+  questions: { questions: [{ id: 'code', type: 'text', question: 'Enter the verification code.' }] },
+  draft: [], status: 'waiting', createdAt: 123,
+}
+const sensitiveForm = { type: 'interview', callId: 'call', title: 'Code confirmation', count: 1 }
+function sensitiveApproval(): InterviewApproval {
+  const item = new Projection().consume(privateView(sensitiveForm, 'interview'))[0]
+  assert.ok(item?.type === 'approval' && item.form?.type === 'interview')
+  return { ...item, form: item.form }
+}
+
+for (const action of ['submit', 'cancel'] as const) test(`credential interview ${action} uses the native interview route without a partial-draft write`, async () => {
+  const { state, phone } = httpFixture(sensitiveForm, 'interview')
+  state.interview = structuredClone(sensitiveSource)
+  const item = sensitiveApproval()
+  const signal = new AbortController().signal
+  assert.equal(await phone.sensitiveInterviewCurrent('1', item, sensitiveSource, signal), true)
+  const answer = action === 'submit' ? { action, draft: [{ id: 'code', value: '001234' }] } : { action }
+  await phone.answerSensitiveInterview('1', item, sensitiveSource, answer, signal)
+  assert.deepEqual(state.posts, [{ path: '/api/c/1/interviews/call', body: answer }])
+})
+
+for (const change of ['withdraw', 'id', 'conversation', 'tool', 'call', 'form-call', 'form-count', 'form-title', 'questions', 'draft', 'ended', 'role', 'team']) {
+  test(`credential interview ${change} invalidates both submission and explicit skip`, async () => {
+    const { state, phone } = httpFixture(sensitiveForm, 'interview')
+    state.interview = structuredClone(sensitiveSource)
+    const item = sensitiveApproval()
+    const current = state.view.approvals![0]!
+    if (change === 'withdraw') state.view.approvals = []
+    else if (change === 'id') current.id = 'replacement'
+    else if (change === 'conversation') current.conversationId = 2
+    else if (change === 'tool') current.tool = 'replacement'
+    else if (change === 'call') current.callId = 'replacement'
+    else if (change === 'form-call') current.form = { ...sensitiveForm, callId: 'replacement' }
+    else if (change === 'form-count') current.form = { ...sensitiveForm, count: 2 }
+    else if (change === 'form-title') current.form = { ...sensitiveForm, title: 'replacement' }
+    else if (change === 'questions') state.interview = { ...sensitiveSource, createdAt: 456 }
+    else if (change === 'draft') state.interview = { ...sensitiveSource, draft: [{ id: 'code', value: 'phone-edited' }] }
+    else if (change === 'ended') state.interview = { ...sensitiveSource, status: 'completed' }
+    else if (change === 'role') state.role = 'guest'
+    else state.team = true
+    const signal = new AbortController().signal
+    assert.equal(await phone.sensitiveInterviewCurrent('1', item, sensitiveSource, signal), false)
+    await assert.rejects(phone.answerSensitiveInterview('1', item, sensitiveSource, { action: 'submit', draft: [{ id: 'code', value: '001234' }] }, signal))
+    await assert.rejects(phone.answerSensitiveInterview('1', item, sensitiveSource, { action: 'cancel' }, signal))
+    assert.deepEqual(state.posts, [])
+  })
+}
+
+for (const action of ['submit', 'cancel'] as const) test(`an uncertain credential interview ${action} acknowledgement never causes a second POST`, async () => {
+  const { state, phone } = httpFixture(sensitiveForm, 'interview')
+  state.interview = structuredClone(sensitiveSource); state.fail = true
+  const item = sensitiveApproval()
+  const answer = action === 'submit' ? { action, draft: [{ id: 'code', value: '001234' }] } : { action }
+  await assert.rejects(phone.answerSensitiveInterview('1', item, sensitiveSource, answer, new AbortController().signal))
+  assert.equal(state.posts.length, 1)
+  assert.deepEqual(state.posts[0], { path: '/api/c/1/interviews/call', body: answer })
+})
+
+test('credential interview submission rejects malformed drafts and never attaches local answers to cancellation', async () => {
+  const { state, phone } = httpFixture(sensitiveForm, 'interview')
+  state.interview = structuredClone(sensitiveSource)
+  const item = sensitiveApproval()
+  for (const answer of [
+    { action: 'cancel', draft: [{ id: 'code', value: '001234' }] },
+    { action: 'submit' },
+    { action: 'submit', draft: [{ id: 'code', value: '' }] },
+    { action: 'submit', draft: [{ id: 'code', value: ['001234'] }] },
+    { action: 'submit', draft: [{ id: 'unknown', value: '001234' }] },
+    { action: 'submit', draft: [{ id: 'code', value: '001234', attachments: [] }] },
+    { action: 'submit', draft: [{ id: 'code', value: '001234' }, { id: 'code', value: '001234' }] },
+  ]) await assert.rejects(phone.answerSensitiveInterview('1', item, sensitiveSource, answer as InterviewAnswer, new AbortController().signal))
+  assert.deepEqual(state.posts, [])
+})
+
+test('credential interview choice answers retain native Other/notes shapes and reject malformed selections', async () => {
+  const form = { ...sensitiveForm, count: 2 }
+  const original = { ...sensitiveSource, questions: { title: 'Credential confirmation', questions: [
+    { id: 'single', type: 'single', question: 'Choose.', options: ['A', 'B'] },
+    { id: 'multi', type: 'multi', question: 'Choose.', options: ['A', 'B'] },
+  ] } }
+  const { state, phone } = httpFixture(form, 'interview'); state.interview = original
+  const item = { ...sensitiveApproval(), form: { ...sensitiveApproval().form, count: 2 } }
+  for (const draft of [
+    [{ id: 'single', value: 'A' }], [{ id: 'single', value: { option: '' } }],
+    [{ id: 'multi', value: [] }], [{ id: 'multi', value: [{ option: 'A' }, { option: 'A' }] }],
+    [{ id: 'multi', value: [{ option: 'A', note: '' }] }],
+  ]) await assert.rejects(phone.answerSensitiveInterview('1', item, original, { action: 'submit', draft }, new AbortController().signal))
+  assert.deepEqual(state.posts, [])
+  const answer = { action: 'submit' as const, draft: [
+    { id: 'single', value: { option: 'Other label' } },
+    { id: 'multi', value: [{ option: 'B', note: 'CANARY_note' }, { option: 'A' }] },
+  ] }
+  await phone.answerSensitiveInterview('1', item, original, answer, new AbortController().signal)
+  assert.deepEqual(state.posts, [{ path: '/api/c/1/interviews/call', body: answer }])
 })

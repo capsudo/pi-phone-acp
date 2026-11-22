@@ -3,10 +3,10 @@ import { z } from 'zod'
 import { createdSchema, helloSchema, historySchema, pollSchema, submittedSchema, viewSchema } from './contract.js'
 import type { Entry, View } from './contract.js'
 import { PhoneHttp, PhoneHttpError } from './http.js'
-import type { PhoneBackend, PhoneEvent, PhoneSession, PrivateApproval, SecretAskApproval } from './phone.js'
+import type { PhoneBackend, PhoneEvent, PhoneSession, PrivateApproval, SecretAskApproval, InterviewApproval, InterviewAnswer } from './phone.js'
 import { privateValues, supportedPrivateForm } from './private-forms.js'
 import { Projection } from './projection.js'
-import { askValues, supportedSecretAsk, type ResponseItem } from './forms.js'
+import { askValues, supportedSecretAsk, interviewFormSchema, supportedInterview, sensitiveInterview, responseItemSchema, type ResponseItem } from './forms.js'
 
 const okSchema = z.object({ ok: z.literal(true) })
 const nativeId = (id: string) => {
@@ -227,6 +227,53 @@ export class HttpPhoneBackend implements PhoneBackend {
     const body = form.type === 'secret' ? { value: checked.value } : { values: checked, remember: false, useSaved: false }
     // A lost response may mean values were filled or saved. Never resend it.
     await this.http.json(path, okSchema, signal, body)
+  }
+
+  async sensitiveInterviewCurrent(id: string, approval: InterviewApproval, original: unknown, signal: AbortSignal): Promise<boolean> {
+    const expected = interviewFormSchema.safeParse(approval.form)
+    if (!expected.success) return false
+    const interview = supportedInterview(original, expected.data.count, true)
+    if (!sensitiveInterview(interview)) return false
+    const hello = await this.http.json('/api/me', helloSchema, signal)
+    if (hello.user.role !== 'owner' || hello.user.team) return false
+    const stream = this.views(nativeId(id), signal)
+    try {
+      const { value: view } = await stream.next()
+      const current = view?.approvals?.find(item => item.id === approval.id)
+      if (!current || current.conversationId !== Number(id) || current.tool !== approval.tool || (current.callId ?? current.id) !== approval.callId) return false
+      const form = interviewFormSchema.safeParse(current.form)
+      if (!form.success || (current.callId !== undefined && current.callId !== form.data.callId) ||
+          JSON.stringify(form.data) !== JSON.stringify(expected.data)) return false
+    } finally { await stream.return(undefined) }
+    const current = await this.getInterview(id, expected.data.callId, signal)
+    signal.throwIfAborted()
+    return JSON.stringify(current) === JSON.stringify(original)
+  }
+
+  async answerSensitiveInterview(id: string, approval: InterviewApproval, original: unknown, answer: InterviewAnswer, signal: AbortSignal): Promise<void> {
+    const checked = z.discriminatedUnion('action', [
+      z.strictObject({ action: z.literal('cancel') }),
+      z.strictObject({ action: z.literal('submit'), draft: z.array(responseItemSchema) }),
+    ]).parse(answer)
+    if (checked.action === 'submit') {
+      const interview = supportedInterview(original, approval.form.count, true)
+      const questions = new Map(interview.questions.questions.filter(q => q.type !== 'info').map(q => [q.id, q]))
+      if (new Set(checked.draft.map(item => item.id)).size !== checked.draft.length) throw new Error('Invalid interview answers')
+      const choice = z.strictObject({ option: z.string().min(1), note: z.string().min(1).optional() })
+      for (const item of checked.draft) {
+        const question = questions.get(item.id)
+        if (!question || item.attachments !== undefined) throw new Error('Invalid interview answers')
+        if (question.type === 'text') z.string().min(1).parse(item.value)
+        else {
+          const choices = question.type === 'multi' ? z.array(choice).min(1).parse(item.value) : [choice.parse(item.value)]
+          if (new Set(choices.map(item => item.option)).size !== choices.length) throw new Error('Invalid interview answers')
+        }
+      }
+    }
+    if (!await this.sensitiveInterviewCurrent(id, approval, original, signal)) throw new Error('Sensitive interview changed')
+    signal.throwIfAborted()
+    // No intermediate draft is saved. Attempt the final submit or explicit skip once.
+    await this.answerInterview(id, approval.form.callId, checked, signal)
   }
 
   async getInterview(id: string, callId: string, signal: AbortSignal): Promise<unknown> {
