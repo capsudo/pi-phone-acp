@@ -33,12 +33,12 @@ Both the computer running the ADE and the android phone must be on the **same Ta
 
 ## Features
 
-- **Approvals:** Allow or deny phone action requests directly from the ADE.
+- **Action Approvals<sup>[1]</sup> :** Allow or deny phone action requests directly from the ADE.
 - **Extension questions:** Answer questions and text-entry forms from pi-phone extensions.
 - **Interviews:** Complete text and choice questionnaires, with multiple selections, notes, optional questions and final confirmation.
 - **Rich context:** View code snippets, formatted Markdown, tables and option descriptions alongside questions.
 - **Markdown source:** Display literal when requested (such as `**bold**` instead of rendered formatting).
-- **Secrets input<sup>*</sup>:** Enter passwords and security codes in **masked prompts** for the following requests:
+- **Secrets input<sup>[2]</sup>:** Enter passwords and security codes in **masked prompts** for the following requests:
     - [x] Secret storage — prompts to save a secret in pi-phone Settings → Secrets.
     - [x] Browser sign-in — prompts to fill username/password fields in pi-phone's browser.
     - [x] Browser security code — prompts to fill a security-code field in pi-phone's browser.
@@ -49,7 +49,8 @@ Both the computer running the ADE and the android phone must be on the **same Ta
     > Unchecked items are not yet forwarded, even as regular prompts. These requests must be answered on the phone.
 - **Rich-content fallback:** Forms containing images, interactive previews or other unsupported content stay on the phone, with a notice in the ADE rather than an incomplete form.
 
-_<sup>*</sup> T3 Code only_
+_[1] Requires permission mode to be set to "Supervised" in ADE, othwerise "Full access" can auto approve them.<br/>In any case pi-phone still decides which actions require approval._<br/>
+_[2] T3 Code only._
 
 Targets the pi-phone **build-508** interface (`c59e0ceb993dc0ded331eeb6758f86bbaed75cec`); used with **T3 Code 0.1.8** (ACP v1).
 
