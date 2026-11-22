@@ -47,12 +47,14 @@ Both the computer running the ADE and the android phone must be on the **same Ta
     - [x] Extension Forms secret fields — prompts from extensions for fields with `secret: true`.
     - [x] Credential prompts within interviews.
     > Unchecked items are not yet forwarded, even as regular prompts. These requests must be answered on the phone.
+- **Ordinary input fallback:** ADEs with form support but no private-input helper offer 2 fallback options: "Continue with ordinary input" or "Complete in pi-phone".
 - **Rich-content fallback:** Forms containing images, interactive previews or other unsupported content stay on the phone, with a notice in the ADE rather than an incomplete form.
 
 _[1] Requires permission mode to be set to "Supervised" in ADE, othwerise "Full access" can auto approve them.<br/>In any case pi-phone still decides which actions require approval._<br/>
 _[2] T3 Code only._
 
-Targets the pi-phone **build-508** interface (`c59e0ceb993dc0ded331eeb6758f86bbaed75cec`); used with **T3 Code 0.1.8** (ACP v1).
+Targets the pi-phone **build-508** interface (`c59e0ceb993dc0ded331eeb6758f86bbaed75cec`), ACP v1.<br/>
+Tested on **T3 Code 0.1.8** (and Zed 1.28.1 for ordinary input fallback).
 
 ## Build and configure
 
@@ -85,9 +87,9 @@ After separately approving provider setup, T3 can use a **Local ACP command** wi
 
 - Reconnecting restores the phone conversation and observes existing work without restarting it or sending another prompt.
 - Submissions are never retried automatically, so inspect the phone conversation and reload it before retrying an uncertain result.
-- Stop affects the whole phone conversation, including queued messages, rather than just the current input request. T3 specific?
 - Secret-store prompts values are saved in pi-phone Settings > Secrets. This is not the case for browser sign-in prompts which only fill corresponding fields. 
 - Declining a private prompt rejects only its matching phone request, while cancellation, timeout and disconnect leave it unanswered.
+- Interview answers are saved in pi-phone and returned to the LLM.
 
 ## Limits
 
@@ -96,6 +98,7 @@ After separately approving provider setup, T3 can use a **Local ACP command** wi
 - Messages sent to the same phone conversation from another client can make the ADE turn fail because the adapter cannot reliably identify which response belongs to it.
 - After an adapter disconnection, questions still waiting on the phone must be completed there, whether they appeared in the ADE earlier or were asked while disconnected.
 - Forms with partially completed answers saved on the phone (entered text or selected choices), or with saved sign-in choices, must be completed through the phone's interface.
+- When falling back to ordinary input (when ADE does not support Masked Inputs), "secrets" may be visible and retained in the ADE history or logs.
 
 ### T3 Code specific
 

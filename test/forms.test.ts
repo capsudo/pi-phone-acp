@@ -329,9 +329,10 @@ test('the collection boundary refuses sensitive, mixed and unknown forms even wi
   }
 })
 
-test('mixed ordinary and private interviews are refused before collecting any answer', async () => {
+test('mixed ordinary and sensitive interviews require checked phone submission before any collection', async () => {
   for (const question of ['Enter your password', 'Enter the verification code', 'Enter your API key']) {
     const phone = new FormsPhone({ ...interviewForm, count: 2 })
+    Object.defineProperty(phone, 'answerSensitiveInterview', { value: undefined })
     phone.source = { questions: { questions: [
       { id: 'ordinary', type: 'text', question: 'An ordinary question first.' },
       { id: 'private', type: 'text', question },
@@ -343,7 +344,7 @@ test('mixed ordinary and private interviews are refused before collecting any an
       assert.equal(phone.getCount, 1)
       assert.deepEqual(phone.answers, [])
       assert.equal(phone.stops, 0)
-      assert.match(JSON.stringify(h.updates), /private-input helper or owner-checked phone submission is unavailable/)
+      assert.match(JSON.stringify(h.updates), /supported collection or owner-checked phone submission is unavailable/)
       assert.match(JSON.stringify(h.updates), /Complete it in pi-phone/)
     } finally { h.connection.close() }
   }
@@ -392,11 +393,10 @@ for (const action of ['decline', 'cancel']) test(`interview ${action} preserves 
   } finally { h.connection.close() }
 })
 
-test('unsupported rich content, images, saved drafts, helpers and sensitive interviews are not partially forwarded', async () => {
+test('unsupported rich content, images, saved drafts and helpers are not partially forwarded', async () => {
   const cases = [
     { ...questions, questions: { questions: [{ id: 'photo', type: 'image', question: 'Photo?' }] } },
     { ...questions, questions: { questions: [{ id: 'x', type: 'text', question: 'Answer?', media: { type: 'html', html: '<b>DO_NOT_LEAK</b>' } }] } },
-    { ...questions, questions: { questions: [{ id: 'x', type: 'text', question: 'Enter the one-time code' }] } },
     { ...questions, draft: [{ id: 'text', value: 'DO_NOT_LEAK' }] },
     { ...questions, asked: { x: [{ q: 'DO_NOT_LEAK' }] } },
     { ...questions, status: 'timeout' },
@@ -770,7 +770,7 @@ for (const submit of [true, false]) test(`credential interview final confirmatio
   } finally { await h.close() }
 })
 
-for (const mode of ['helper', 'forms', 'directory', 'handler', 'owner', 'approval']) test(`credential interview missing/changed ${mode} blocks the entire interview before entry`, async () => {
+for (const mode of ['forms', 'directory', 'handler', 'owner', 'approval']) test(`credential interview missing/changed ${mode} blocks the entire interview before entry`, async () => {
   const phone = credentialPhone()
   phone.ownerChanged = mode === 'owner'
   phone.approvalChanged = mode === 'approval'
@@ -1039,4 +1039,206 @@ test('credential questions without a visible title still have a nonempty passwor
     assert.equal((card.params.params as { arguments: { label: string } }).arguments.label, 'Interview answer')
     assert.equal(phone.answers.length, 1)
   } finally { await h.close() }
+})
+
+const ordinaryConsent = { collection: 'Continue with ordinary input' }
+function ordinaryProperties(params: acp.CreateElicitationRequest) {
+  assert.equal(params.mode, 'form')
+  assert.ok('requestedSchema' in params)
+  return (params.requestedSchema as { properties: Record<string, acp.ElicitationPropertySchema> }).properties
+}
+
+test('ordinary credential interviews warn before any answer and collect text, Other and choice notes without a private helper', async () => {
+  const source = { questions: { title: 'Account details', description: '**Dummy-only** interview.', questions: [
+    ...credentialSource.questions.questions,
+    { id: 'checks', type: 'multi', question: 'Choose checks.', options: ['Build', { label: 'Tests', content: { source: '**Test context**', lang: 'md' } }] },
+    { id: 'other', type: 'single', question: 'Choose region.', options: ['A', 'B'] },
+    { id: 'skip', type: 'text', question: 'Optional comment?' },
+    { id: 'outro', type: 'info', question: 'End of review.' },
+  ] }, draft: [], status: 'waiting', createdAt: 123 }
+  const phone = credentialPhone(source, 5)
+  const replies = [ordinaryConsent, { route: 'answer' }, { value: 'CANARY_name' }, { route: 'answer' }, { value: '001234' },
+    { route: 'options' }, { value: ['Build', 'Tests'] }, { addNote: true }, { note: 'CANARY_note' }, { addNote: false },
+    { route: 'other' }, { value: 'CANARY_other' }, { route: 'skip' }, { submit: true }]
+  const respond = queued(replies)
+  const h = await harness(phone, params => {
+    const properties = ordinaryProperties(params)
+    assert.deepEqual(phone.answers, [])
+    assert.match(params.message, /saved in pi-phone and returned to the phone model/)
+    assert.match(params.message, /Masking depends on the ADE/)
+    if ('collection' in properties) {
+      assert.equal(phone.sensitiveChecks, 1)
+      assert.deepEqual(Object.keys(properties), ['collection'])
+      assert.match(String(properties.collection!.description), /visible and retained in ADE history or logs/)
+    } else if ((properties.value?.type === 'string' && !('enum' in properties.value)) || 'note' in properties) {
+      assert.match(String((properties.value ?? properties.note)!.description), /not private delivery/)
+    }
+    return respond(params)
+  })
+  try {
+    await h.result
+    assert.deepEqual(replies, [])
+    assert.equal(phone.sensitiveChecks, 3)
+    assert.equal(phone.getCount, 4)
+    assert.deepEqual(phone.answers, [{ kind: 'interview', id: '1', callId: 'call/1', action: 'submit', draft: [
+      { id: 'name', value: 'CANARY_name' }, { id: 'credential', value: '001234' },
+      { id: 'checks', value: [{ option: 'Build', note: 'CANARY_note' }, { option: 'Tests' }] }, { id: 'other', value: { option: 'CANARY_other' } },
+    ] }])
+    assert.match(h.requests.at(-1)!.message, /Answer entered/)
+    assert.match(h.requests.at(-1)!.message, /End of review/)
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.updates), /CANARY_|001234/)
+  } finally { h.connection.close() }
+})
+
+for (const outcome of ['phone', 'cancel', 'decline', 'malformed', 'unsupported', 'owner', 'interview']) test(`ordinary interview warning ${outcome} does not open answer fields`, async () => {
+  const phone = credentialPhone()
+  const h = await harness(phone, params => {
+    assert.deepEqual(Object.keys(ordinaryProperties(params)), ['collection'])
+    if (outcome === 'phone') return { action: 'accept', content: { collection: 'Complete in pi-phone' } }
+    if (outcome === 'unsupported') throw new acp.RequestError(-32601, 'DO_NOT_LEAK CANARY_error')
+    if (outcome === 'malformed') return { action: 'accept', content: { collection: 'Continue with ordinary input', value: 'CANARY_value' } }
+    if (outcome === 'owner' || outcome === 'interview') {
+      if (outcome === 'owner') phone.ownerChanged = true
+      else phone.source = { ...credentialSource, createdAt: 456 }
+      return { action: 'accept', content: ordinaryConsent }
+    }
+    return { action: outcome }
+  }, true, true)
+  try {
+    if (outcome === 'decline') await h.result
+    else { await until(() => h.updates.length > 0); await settleFallback(h, phone) }
+    assert.equal(h.requests.length, 1)
+    assert.deepEqual(phone.answers, outcome === 'decline' ? [{ kind: 'interview', id: '1', callId: 'call/1', action: 'cancel' }] : [])
+    assert.equal(phone.stops, 0)
+    assert.doesNotMatch(JSON.stringify(h.updates), /CANARY_|DO_NOT_LEAK/)
+  } finally { h.connection.close() }
+})
+
+for (const outcome of ['decline', 'cancel', 'malformed']) test(`ordinary interview ${outcome} after partial answers never sends a draft`, async () => {
+  const phone = credentialPhone()
+  const initial = queued([ordinaryConsent, { route: 'answer' }, { value: 'CANARY_partial' }, { route: 'answer' }])
+  let responses = 0
+  const h = await harness(phone, params => {
+    if (++responses <= 4) return initial(params)
+    return outcome === 'malformed' ? { action: 'accept', content: { value: 1234 } } : { action: outcome }
+  }, true, true)
+  try {
+    if (outcome === 'decline') await h.result
+    else { await until(() => h.updates.length > 0); await settleFallback(h, phone) }
+    assert.deepEqual(phone.answers, outcome === 'decline' ? [{ kind: 'interview', id: '1', callId: 'call/1', action: 'cancel' }] : [])
+    assert.equal(h.requests.length, 5)
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.updates), /CANARY_|1234/)
+  } finally { h.connection.close() }
+})
+
+for (const outcome of ['false', 'owner', 'approval', 'interview', 'uncertain']) test(`ordinary interview final ${outcome} preserves checked submission and never retries`, async () => {
+  const phone = credentialPhone()
+  phone.failAnswer = outcome === 'uncertain'
+  const initial = queued([ordinaryConsent, { route: 'answer' }, { value: 'CANARY_partial' }, { route: 'skip' }])
+  const h = await harness(phone, params => {
+    if (!('submit' in ordinaryProperties(params))) return initial(params)
+    assert.match(params.message, /Answer entered/)
+    assert.doesNotMatch(params.message, /CANARY_/)
+    if (outcome === 'owner') phone.ownerChanged = true
+    if (outcome === 'approval') phone.approvalChanged = true
+    if (outcome === 'interview') phone.source = { ...credentialSource, createdAt: 456 }
+    return { action: 'accept', content: { submit: outcome !== 'false' } }
+  }, true, true)
+  try {
+    await until(() => h.updates.length > 0)
+    await settleFallback(h, phone)
+    assert.equal(h.requests.length, 5)
+    assert.deepEqual(phone.answers, outcome === 'uncertain' ? [{ kind: 'interview', id: '1', callId: 'call/1', action: 'submit', draft: [{ id: 'name', value: 'CANARY_partial' }] }] : [])
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.updates), /CANARY_|DO_NOT_LEAK/)
+  } finally { h.connection.close() }
+})
+
+for (const stage of ['warning', 'entry']) for (const action of ['withdraw', 'cancel', 'disconnect']) test(`ordinary interview ${action} during ${stage} ignores late answers`, async () => {
+  const phone = credentialPhone()
+  const asked = Promise.withResolvers<void>(), released = Promise.withResolvers<void>()
+  const initial = queued([ordinaryConsent, { route: 'answer' }, { value: 'CANARY_partial' }, { route: 'answer' }])
+  let responses = 0
+  const h = await harness(phone, async (params, signal) => {
+    if (stage === 'entry' && ++responses <= 4) return initial(params)
+    asked.resolve()
+    await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+    released.resolve()
+    return { action: 'accept', content: stage === 'warning' ? ordinaryConsent : { value: '001234' } }
+  })
+  try {
+    const rejected = action === 'disconnect' ? assert.rejects(h.result) : undefined
+    await asked.promise
+    if (action === 'withdraw') phone.withdraw()
+    else if (action === 'cancel') await h.agent.notify(acp.methods.agent.session.cancel, { sessionId: '1' })
+    else { h.connection.close(); await rejected }
+    await released.promise
+    phone.ended.resolve()
+    if (action !== 'disconnect') await h.result
+    await tick()
+    assert.deepEqual(phone.answers, [])
+    assert.equal(phone.stops, action === 'cancel' ? 1 : 0)
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.updates), /CANARY_|001234/)
+  } finally { h.connection.close() }
+})
+
+test('ordinary credential interviews without form support remain on the phone before fetching questions', async () => {
+  const phone = credentialPhone()
+  const h = await harness(phone, () => { assert.fail('No form capability') }, false, true)
+  try { await settleFallback(h, phone); assert.equal(phone.getCount, 0); assert.deepEqual(phone.answers, []) } finally { h.connection.close() }
+})
+
+for (const source of [
+  { ...credentialSource, draft: [{ id: 'name', value: 'CANARY_phone_draft' }] },
+  { ...credentialSource, questions: { questions: [...credentialSource.questions.questions, { id: 'extra', type: 'info', question: '![CANARY_image](local.png)' }] } },
+]) test('ordinary sensitive interviews validate the entire source before the warning or answer collection', async () => {
+  const phone = credentialPhone(source)
+  const h = await harness(phone, () => { assert.fail('Unsupported source opened a warning') }, true, true)
+  try { await settleFallback(h, phone); assert.deepEqual(h.requests, []); assert.deepEqual(phone.answers, []); assert.doesNotMatch(JSON.stringify(h.updates), /CANARY_/) } finally { h.connection.close() }
+})
+
+for (const completion of ['submit', 'decline', 'uncertain']) test(`ordinary credential interview real ACP + HTTP ${completion} writes only one checked final decision`, async () => {
+  const fixture = await new PhoneFixture().start()
+  const writes: { path: string, body: unknown }[] = []
+  let ownerChecks = 0, reads = 0
+  const request: typeof fetch = async (input, init) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/me') ownerChecks++
+    if (url.pathname === '/api/c/1/interviews/call%2F1') {
+      if (init?.method !== 'POST') { reads++; return Response.json(credentialSource) }
+      writes.push({ path: url.pathname, body: JSON.parse(String(init.body)) })
+      if (completion === 'uncertain') throw new Error('DO_NOT_LEAK CANARY_uncertain')
+      fixture.conversations.get(1)!.approvals = []
+      fixture.finish(1, 'Interview completed.')
+      return Response.json({ ...credentialSource, status: completion === 'decline' ? 'cancelled' : 'completed' })
+    }
+    return fetch(input, init)
+  }
+  const backend = new HttpPhoneBackend(new PhoneHttp(fixture.url, fixture.token, request), '/phone/work', 0)
+  const values = queued([ordinaryConsent, { route: 'answer' }, { value: 'CANARY_http_ordinary' }, { route: 'answer' }, { value: '001234' }, { submit: true }])
+  let responses = 0
+  const h = await sensitiveHarness(credentialPhone(), params => completion === 'decline' && ++responses === 5 ? { action: 'decline' } : values(params),
+    () => { assert.fail('No private helper was advertised') }, { backend, server: false })
+  try {
+    await fixture.submitted.promise
+    const native = view({ ...interviewForm, count: 2 }).approvals![0]!
+    native.tool = 'interview'
+    fixture.conversations.get(1)!.approvals = [native]
+    fixture.publish(1)
+    if (completion === 'uncertain') {
+      await until(() => h.updates.some(update => JSON.stringify(update).includes('no automatic retry')))
+      fixture.conversations.get(1)!.approvals = []
+      fixture.finish(1, 'Completed after phone inspection.')
+    }
+    await h.result
+    assert.deepEqual(writes, [{ path: '/api/c/1/interviews/call%2F1', body: completion === 'decline' ? { action: 'cancel' } : {
+      action: 'submit', draft: [{ id: 'name', value: 'CANARY_http_ordinary' }, { id: 'credential', value: '001234' }],
+    } }])
+    assert.equal(ownerChecks, 3)
+    assert.equal(reads, 4)
+    assert.deepEqual(h.privateRequests, [])
+    assert.deepEqual(fixture.answers, [])
+    assert.deepEqual(fixture.privateAnswers, [])
+    assert.equal(fixture.aborts, 0)
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.updates), /CANARY_|001234|DO_NOT_LEAK/)
+  } finally { await h.close(); await fixture.close() }
 })

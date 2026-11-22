@@ -2,6 +2,7 @@ import { z } from 'zod'
 import * as acp from '@agentclientprotocol/sdk/unstable'
 import type { PhoneBackend, PhoneEvent } from './phone.js'
 import { askFormSchema, interviewFormSchema, privateAsk, askValues, formRequest, questionAnswer, questionProperties, questionText, supportedInterview, sensitiveInterview, PhoneOnlyInterview, type ResponseItem } from './forms.js'
+import { confirmOrdinaryInput, ordinaryInputWarning } from './ordinary-input.js'
 import { SecretCards } from './private-input.js'
 import type { SecretFiles } from './secret-files.js'
 import { markdownLabel } from './markdown.js'
@@ -15,7 +16,7 @@ export type InteractiveApproval = Extract<PhoneEvent, { type: 'approval' }>
 /** No form responses go into ACP message/tool updates or adapter diagnostics. */
 export async function forwardInteractive(
   phone: PhoneBackend, id: string, item: InteractiveApproval, client: acp.AgentContext, signal: AbortSignal,
-  options: { privateMcp?: boolean, secretFiles?: SecretFiles, secretTimeoutMs?: number | undefined } = {},
+  options: { privateMcp?: boolean, formSupported?: boolean, secretFiles?: SecretFiles, secretTimeoutMs?: number | undefined } = {},
 ): Promise<'done' | 'phone'> {
   let requestSignal = signal
   const form = item.form
@@ -53,24 +54,39 @@ export async function forwardInteractive(
   const original = await phone.getInterview(id, form.callId, signal)
   const interview = supportedInterview(original, form.count, true)
   const sensitive = sensitiveInterview(interview)
-  if (sensitive && (!options.privateMcp || !options.secretFiles?.supported || !phone.sensitiveInterviewCurrent || !phone.answerSensitiveInterview)) throw new PhoneOnlyInterview('private')
+  const ordinarySensitive = sensitive && !options.privateMcp && options.formSupported === true
+  if (sensitive && ((!ordinarySensitive && (!options.privateMcp || !options.secretFiles?.supported)) || !phone.sensitiveInterviewCurrent || !phone.answerSensitiveInterview)) throw new PhoneOnlyInterview('private')
   const approval = { ...item, form }
   const lifetime = sensitive ? AbortSignal.any([signal, AbortSignal.timeout(20 * 60_000)]) : signal
   requestSignal = lifetime
-  const cards = sensitive ? new SecretCards(client, options.secretFiles!, lifetime) : undefined
+  const cards = sensitive && !ordinarySensitive ? new SecretCards(client, options.secretFiles!, lifetime) : undefined
   const close = () => { void cards?.close() }
   try {
     lifetime.throwIfAborted()
+    if (sensitive && !await phone.sensitiveInterviewCurrent!(id, approval, original, lifetime)) throw new PhoneOnlyInterview('state')
     if (cards) {
-      if (!await phone.sensitiveInterviewCurrent!(id, approval, original, lifetime)) throw new PhoneOnlyInterview('state')
       await cards.open()
       lifetime.addEventListener('abort', close, { once: true })
       lifetime.throwIfAborted()
     }
+    if (ordinarySensitive) {
+      const consent = await confirmOrdinaryInput(request, 'Submitted interview answers are saved in pi-phone and returned to the phone model.')
+      if (consent === 'phone') return 'phone'
+      if (consent === 'decline') {
+        await phone.answerSensitiveInterview!(id, approval, original, { action: 'cancel' }, lifetime)
+        return 'done'
+      }
+      if (!await phone.sensitiveInterviewCurrent!(id, approval, original, lifetime)) throw new PhoneOnlyInterview('state')
+    }
+    const disclosure = ordinarySensitive
+      ? `${ordinaryInputWarning} Submitted interview answers are saved in pi-phone and returned to the phone model. `
+      : sensitive ? 'Text answers use T3 password cards. Submitted interview answers are saved in pi-phone and returned to the phone model; private entry does not change that. '
+        : 'Do not enter passwords or one-time codes here: ordinary T3 answers are stored in history. '
+    const whitespace = ordinarySensitive ? 'The ADE may trim outer whitespace.' : 'T3 trims outer whitespace.'
     const prefix = [markdownLabel(interview.questions.title ?? form.title), interview.questions.description,
-      (sensitive ? 'Text answers use T3 password cards. Submitted interview answers are saved in pi-phone and returned to the phone model; private entry does not change that. ' : 'Do not enter passwords or one-time codes here: ordinary T3 answers are stored in history. ') + 'All answers are optional: use Skip to leave a question unanswered. No defaults are selected automatically. Other and choice notes are supported. T3 trims outer whitespace. Local answers are sent only after the final Submit confirmation. Decline skips the whole interview; Cancel leaves it waiting on the phone.'].filter(Boolean).join('\n\n')
+      `${disclosure}All answers are optional: use Skip to leave a question unanswered. No defaults are selected automatically. Other and choice notes are supported. ${whitespace} Local answers are sent only after the final Submit confirmation. Decline skips the whole interview; Cancel leaves it waiting on the phone.`].filter(Boolean).join('\n\n')
     const textAnswer = async (message: string, name: string, title: string): Promise<z.infer<typeof responseSchema>> => {
-      if (!cards) return request(message, { [name]: { type: 'string', title } }, [name])
+      if (!cards) return request(message, { [name]: { type: 'string', title, ...(ordinarySensitive ? { description: message } : {}) } }, [name])
       lifetime.throwIfAborted()
       const answer = await cards.answer(title.trim() ? title : 'Interview answer',
         `${message}\n\nDecline skips the whole interview without submitting local answers. Cancel or timeout leaves it on the phone. T3 removes outer whitespace; use the phone when it matters.`,

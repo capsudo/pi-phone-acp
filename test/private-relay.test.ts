@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import * as acp from '@agentclientprotocol/sdk/unstable'
 import { createAdapter } from '../src/adapter.js'
 import { Projection } from '../src/projection.js'
+import { forwardOrdinarySensitive } from '../src/ordinary-input.js'
 import { forwardSecretAsk } from '../src/private-input.js'
 import { SecretFiles } from '../src/secret-files.js'
 import type { PhoneBackend, PhoneEvent, PrivateApproval, SecretAskApproval } from '../src/phone.js'
@@ -85,7 +86,9 @@ class PrivatePhone implements PhoneBackend {
   }
   withdraw() { this.changed = true; this.extra.push({ type: 'approval_withdrawn', id: this.approval.id }); this.wake.resolve() }
 }
+type OrdinaryRequest = Extract<acp.CreateElicitationRequest, { requestedSchema: unknown }> & { requestedSchema: { properties: Record<string, acp.ElicitationPropertySchema> } }
 interface HarnessOptions {
+  ordinaryRespond?: (params: OrdinaryRequest, signal: AbortSignal) => unknown | Promise<unknown>
   formSupport?: boolean
   server?: boolean
   backend?: PhoneBackend
@@ -101,6 +104,7 @@ async function harness(phone = new PrivatePhone(), options: HarnessOptions = {})
   const files: string[] = []
   const requests: { method: string, params: Record<string, unknown> }[] = []
   const updates: acp.SessionNotification[] = []
+  const formRequests: OrdinaryRequest[] = []
   let cards = 0
   let ordinaryRequests = 0
   let disconnects = 0
@@ -112,7 +116,14 @@ async function harness(phone = new PrivatePhone(), options: HarnessOptions = {})
     return { isError: false, structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] }
   }
   const client = acp.client()
-    .onRequest(acp.methods.client.elicitation.create, () => { ordinaryRequests++; assert.fail('Secrets must never enter ordinary elicitation') })
+    .onRequest(acp.methods.client.elicitation.create, async ({ params, signal }) => {
+      assert.equal(params.mode, 'form')
+      const form = params as OrdinaryRequest
+      assert.ok(form.requestedSchema.properties)
+      formRequests.push(form)
+      if (!options.ordinaryRespond) { ordinaryRequests++; assert.fail('Unexpected ordinary elicitation') }
+      return await options.ordinaryRespond(form, signal) as acp.CreateElicitationResponse
+    })
     .onRequest(acp.methods.client.session.requestPermission, () => { ordinaryRequests++; assert.fail('Secrets must never enter permission UI') })
     // Installed T3's legacy connectionId-based carrier is different from the
     // SDK's current serverId/requestId carrier; handle its raw wire here.
@@ -147,7 +158,7 @@ async function harness(phone = new PrivatePhone(), options: HarnessOptions = {})
   await agent.request(acp.methods.agent.session.new, workspace)
   const result = agent.request(acp.methods.agent.session.prompt, { sessionId: '1', prompt: [{ type: 'text', text: 'Fixture private request' }] })
   void result.catch(() => {})
-  return { phone, agent, connection, result, requests, updates, files, directory, workspace, save,
+  return { phone, agent, connection, result, requests, formRequests, updates, files, directory, workspace, save,
     disconnects: () => disconnects,
     close: async () => { connection.close(); await rm(base, { recursive: true, force: true }); assert.equal(ordinaryRequests, 0, 'Private collection must not open ordinary forms or permission UI') } }
 }
@@ -594,7 +605,7 @@ for (const mode of ['no-helper', 'changed', 'missing-handler', 'invalid-director
   const phone = new PrivatePhone(extensionApproval())
   phone.changed = mode === 'changed'
   const h = await harness(phone, {
-    formSupport: true, server: mode !== 'no-helper',
+    formSupport: mode !== 'no-helper', server: mode !== 'no-helper',
     ...(mode === 'missing-handler' ? { backend: Object.assign(phone, { answerSecretAsk: undefined }) as PhoneBackend } : {}),
     ...(mode === 'invalid-directory' ? { secretFilesDir: 'relative/not-allowed' } : {}),
   })
@@ -747,4 +758,242 @@ test('an invalid first extension value stops collection before the next password
     assert.deepEqual(phone.declines, [])
     assert.deepEqual(await readdir(h.directory), [])
   } finally { await h.close() }
+})
+
+const continueOrdinary = { action: 'accept', content: { collection: 'Continue with ordinary input' } }
+const ordinaryCases = [
+  { form: browserCode, tool: 'browser_ask_code', values: { code: '001234' }, path: '/api/browser/asks/', destination: /existing code fields/ },
+  { form: browserLogin, tool: 'browser_sign_in', values: { username: ' CANARY_user ', password: ' CANARY_password ' }, path: '/api/browser/asks/', destination: /existing sign-in fields/ },
+  { form: computerLogin, tool: 'computer_sign_in', values: { password: 'CANARY_password', code: '001234' }, path: '/api/computer/asks/', destination: /Dummy laptop/ },
+  { form: storeSecret, tool: 'secret_request', values: { value: 'CANARY_saved_secret' }, path: '/api/secrets/requests/', destination: /Settings > Secrets/ },
+  { form: extensionForm, tool: 'extension_question', values: { account: 'CANARY_account', accessKey: '001234' }, path: '/api/asks/', destination: /requesting extension/ },
+] as const
+
+for (const example of ordinaryCases) test(`ordinary ${example.tool} warns before all-field entry, preserves exact strings and submits once without private transport`, async () => {
+  const phone = new PrivatePhone(example.form.type === 'ask' ? extensionApproval() : privateApproval(example.form, example.tool))
+  const h = await harness(phone, { server: false, formSupport: true, secretFilesDir: '/does-not-exist', ordinaryRespond: params => {
+    assert.deepEqual(phone.answers, [])
+    assert.match(params.message, /not private delivery/)
+    assert.match(params.message, /visible and retained in ADE history or logs/)
+    assert.match(params.message, /Masking depends on the ADE/)
+    assert.match(params.message, example.destination)
+    const properties = params.requestedSchema.properties
+    if ('collection' in properties) {
+      assert.deepEqual(Object.keys(properties), ['collection'])
+      assert.equal(phone.checks, 1)
+      assert.match(String(properties.collection!.description), /not private delivery/)
+      return continueOrdinary
+    }
+    assert.equal(phone.checks, 2)
+    assert.deepEqual(params.requestedSchema.required, Object.keys(example.values))
+    for (const property of Object.values(properties)) {
+      assert.equal(property.type, 'string')
+      assert.match(String(property.description), /not private delivery/)
+    }
+    return { action: 'accept', content: example.values }
+  } })
+  try {
+    await h.result
+    assert.deepEqual(phone.answers, [example.values])
+    assert.equal(phone.checks, 3)
+    assert.deepEqual(phone.declines, [])
+    assert.deepEqual(h.requests, [])
+    assert.equal(h.formRequests.length, 2)
+    assert.deepEqual(await readdir(h.directory), [])
+    assert.doesNotMatch(JSON.stringify(h.formRequests) + JSON.stringify(h.updates), /CANARY_|001234/)
+  } finally { await h.close() }
+})
+
+for (const stage of ['warning', 'entry']) for (const outcome of ['phone', 'cancel', 'decline', 'malformed', 'unsupported', 'changed']) {
+  if (stage === 'entry' && outcome === 'phone') continue
+  test(`ordinary sensitive ${stage} ${outcome} never submits a partial form`, async () => {
+    const phone = new PrivatePhone(extensionApproval())
+    const h = await harness(phone, { server: false, formSupport: true, ordinaryRespond: params => {
+      const warning = 'collection' in params.requestedSchema.properties
+      if (warning && stage === 'entry') return continueOrdinary
+      if (outcome === 'phone') return { action: 'accept', content: { collection: 'Complete in pi-phone' } }
+      if (outcome === 'unsupported') throw new acp.RequestError(-32601, 'DO_NOT_LEAK CANARY_failure')
+      if (outcome === 'malformed') return { action: 'accept', content: { account: 'CANARY_partial', collection: 'Continue with ordinary input' } }
+      if (outcome === 'changed') { phone.changed = true; return warning ? continueOrdinary : { action: 'accept', content: { account: 'CANARY_partial', accessKey: '001234' } } }
+      return { action: outcome }
+    } })
+    try {
+      if (outcome === 'decline') await h.result
+      else await fallback(h)
+      assert.deepEqual(phone.answers, [])
+      assert.deepEqual(phone.declines, outcome === 'decline' ? [phone.approval.id] : [])
+      assert.equal(h.formRequests.length, stage === 'warning' ? 1 : 2)
+      assert.deepEqual(h.requests, [])
+      assert.equal(phone.stops, 0)
+      assert.doesNotMatch(JSON.stringify(h.updates), /DO_NOT_LEAK|CANARY_|001234/)
+    } finally { await h.close() }
+  })
+}
+
+for (const example of ordinaryCases) for (const invalid of ['missing', 'extra', 'empty', 'oversize', 'numeric', 'newline', 'nul']) {
+  if (example.form.type === 'ask' && (invalid === 'newline' || invalid === 'nul')) continue // Native extension asks allow line breaks.
+  test(`ordinary ${example.tool} validates ${invalid} values before its native POST`, async () => {
+    const phone = new PrivatePhone(example.form.type === 'ask' ? extensionApproval() : privateApproval(example.form, example.tool))
+    const content: Record<string, unknown> = { ...example.values }
+    const name = Object.keys(content)[0]!
+    if (invalid === 'missing') delete content[name]
+    else if (invalid === 'extra') content.unexpected = 'CANARY_extra'
+    else content[name] = invalid === 'empty' ? '' : invalid === 'numeric' ? 1234 : invalid === 'newline' ? 'CANARY_line\n' : invalid === 'nul' ? 'CANARY_\u0000' : 'x'.repeat(example.form.type === 'ask' ? 4097 : 16_385)
+    const h = await harness(phone, { server: false, formSupport: true, ordinaryRespond: params => 'collection' in params.requestedSchema.properties ? continueOrdinary : { action: 'accept', content } })
+    try {
+      await fallback(h)
+      assert.deepEqual(phone.answers, [])
+      assert.deepEqual(phone.declines, [])
+      assert.equal(h.formRequests.length, 2)
+      assert.doesNotMatch(JSON.stringify(h.updates), /CANARY_|1234|DO_NOT_LEAK/)
+    } finally { await h.close() }
+  })
+}
+
+for (const stage of ['warning', 'entry']) for (const action of ['withdraw', 'cancel', 'disconnect']) test(`ordinary sensitive ${action} during ${stage} ignores late answers without native decisions`, async () => {
+  const phone = new PrivatePhone(extensionApproval())
+  phone.asyncMode = action === 'withdraw'
+  const asked = Promise.withResolvers<void>(), released = Promise.withResolvers<void>()
+  const h = await harness(phone, { server: false, formSupport: true, ordinaryRespond: async (params, signal) => {
+    const warning = 'collection' in params.requestedSchema.properties
+    if (warning && stage === 'entry') return continueOrdinary
+    asked.resolve()
+    await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+    released.resolve()
+    return warning ? continueOrdinary : { action: 'accept', content: { account: 'CANARY_late', accessKey: '001234' } }
+  } })
+  try {
+    const rejected = action === 'disconnect' ? assert.rejects(h.result) : undefined
+    await asked.promise
+    if (action === 'withdraw') phone.withdraw()
+    else if (action === 'cancel') await h.agent.notify(acp.methods.agent.session.cancel, { sessionId: '1' })
+    else { h.connection.close(); await rejected }
+    await released.promise
+    phone.ended.resolve()
+    if (action !== 'disconnect') await h.result
+    await tick()
+    assert.deepEqual(phone.answers, [])
+    assert.deepEqual(phone.declines, [])
+    assert.equal(phone.stops, action === 'cancel' ? 1 : 0)
+    assert.doesNotMatch(JSON.stringify(h.updates), /CANARY_|001234/)
+  } finally { await h.close() }
+})
+
+for (const decline of [false, true]) test(`ordinary sensitive uncertain ${decline ? 'Decline' : 'answer'} POST never reopens fields or retries`, async () => {
+  const phone = new PrivatePhone(extensionApproval())
+  phone.failAnswer = !decline; phone.failDecline = decline
+  const h = await harness(phone, { server: false, formSupport: true, ordinaryRespond: params => 'collection' in params.requestedSchema.properties ? continueOrdinary
+    : decline ? { action: 'decline' } : { action: 'accept', content: { account: 'CANARY_uncertain', accessKey: '001234' } } })
+  try {
+    await fallback(h)
+    assert.equal(phone.answers.length, decline ? 0 : 1)
+    assert.equal(phone.declines.length, decline ? 1 : 0)
+    assert.equal(h.formRequests.length, 2)
+    assert.match(JSON.stringify(h.updates), /no automatic retry/)
+    assert.doesNotMatch(JSON.stringify(h.updates), /CANARY_|001234|DO_NOT_LEAK/)
+  } finally { await h.close() }
+})
+
+test('ordinary sensitive replay outside an active turn stays observation-only', async () => {
+  const phone = new PrivatePhone()
+  const h = await harness(phone, { server: false, formSupport: true, ordinaryRespond: params => 'collection' in params.requestedSchema.properties ? continueOrdinary : { action: 'accept', content: { code: '001234' } } })
+  try {
+    await h.result
+    await h.agent.request(acp.methods.agent.session.load, { ...h.workspace, sessionId: '1' })
+    assert.equal(h.formRequests.length, 2)
+    assert.equal(phone.answers.length, 1)
+    assert.match(JSON.stringify(h.updates), /observation only/)
+  } finally { await h.close() }
+})
+
+test('ordinary sensitive collection independently checks capability, strict schemas, saved choices and checked handlers', async () => {
+  const client = { request: async () => { assert.fail('Unsupported input opened a form') } } as unknown as acp.AgentContext
+  for (const options of [{ formSupported: false, privateMcp: false }, { formSupported: true, privateMcp: true }]) {
+    const phone = new PrivatePhone()
+    assert.equal(await forwardOrdinarySensitive(phone, '1', phone.approval, client, new AbortController().signal, options), 'phone')
+    assert.equal(phone.checks, 0)
+  }
+  const options = { formSupported: true, privateMcp: false }
+  for (const form of [{ ...browserLogin, saved: true }, { ...browserCode, extra: 'CANARY_unknown' }, { type: 'crd-setup', pin: 'CANARY_unknown' }]) {
+    const phone = new PrivatePhone({ ...privateApproval(), privateForm: form } as unknown as PrivateApproval)
+    assert.equal(await forwardOrdinarySensitive(phone, '1', phone.approval, client, new AbortController().signal, options), 'phone')
+    assert.equal(phone.checks, 0)
+  }
+  for (const form of [{ ...extensionForm, fields: [{ name: 'key', label: 'Key' }] }, { ...extensionForm, fields: [...extensionForm.fields, extensionForm.fields[0]] }]) {
+    const phone = new PrivatePhone({ ...extensionApproval(), form } as SecretAskApproval)
+    assert.equal(await forwardOrdinarySensitive(phone, '1', phone.approval, client, new AbortController().signal, options), 'phone')
+    assert.equal(phone.checks, 0)
+  }
+  for (const kind of ['private', 'extension']) {
+    const phone = new PrivatePhone(kind === 'private' ? privateApproval() : extensionApproval())
+    Object.defineProperty(phone, kind === 'private' ? 'answerPrivate' : 'answerSecretAsk', { value: undefined })
+    assert.equal(await forwardOrdinarySensitive(phone, '1', phone.approval, client, new AbortController().signal, options), 'phone')
+    assert.equal(phone.checks, 0)
+  }
+})
+
+for (const example of ordinaryCases) for (const uncertain of [false, true]) test(`ordinary ${example.tool} real ACP + HTTP ${uncertain ? 'lost acknowledgement' : 'completion'} preserves the native destination and attempts one POST`, async () => {
+  const fixture = await new PhoneFixture().start()
+  const writes: { path: string, body: unknown }[] = []
+  let ownerChecks = 0
+  const request: typeof fetch = async (input, init) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/me') ownerChecks++
+    if (init?.method === 'POST' && url.pathname.startsWith(example.path)) {
+      writes.push({ path: url.pathname, body: JSON.parse(String(init.body)) })
+      if (uncertain) throw new Error('DO_NOT_LEAK CANARY_uncertain_http')
+      fixture.conversations.get(1)!.approvals = []
+      fixture.finish(1, 'Ordinary input completed.')
+      return Response.json({ ok: true })
+    }
+    return fetch(input, init)
+  }
+  const backend = new HttpPhoneBackend(new PhoneHttp(fixture.url, fixture.token, request), '/phone/work', 0)
+  const h = await harness(new PrivatePhone(), { backend, server: false, formSupport: true,
+    ordinaryRespond: params => 'collection' in params.requestedSchema.properties ? continueOrdinary : { action: 'accept', content: example.values } })
+  try {
+    await fixture.submitted.promise
+    const native = privateView(example.form, example.tool).approvals![0]!
+    fixture.conversations.get(1)!.approvals = [native]
+    fixture.publish(1)
+    if (uncertain) {
+      await until(() => h.updates.some(update => JSON.stringify(update).includes('no automatic retry')))
+      fixture.conversations.get(1)!.approvals = []
+      fixture.finish(1, 'Completed after phone inspection.')
+    }
+    await h.result
+    const body = 'value' in example.values ? { value: example.values.value }
+      : example.form.type === 'ask' ? { values: example.values } : { values: example.values, remember: false, useSaved: false }
+    assert.deepEqual(writes, [{ path: example.path + encodeURIComponent(native.id), body }])
+    assert.equal(ownerChecks, 3)
+    assert.deepEqual(fixture.answers, [])
+    assert.deepEqual(fixture.privateAnswers, [])
+    assert.equal(fixture.aborts, 0)
+    assert.deepEqual(h.requests, [])
+    assert.equal(h.formRequests.length, 2)
+    assert.doesNotMatch(JSON.stringify(h.formRequests) + JSON.stringify(h.updates), /CANARY_|001234|DO_NOT_LEAK/)
+  } finally { await h.close(); await fixture.close() }
+})
+
+for (const kind of ['private', 'extension']) for (const failure of ['connect', 'result', 'directory']) test(`advertised private ${kind} ${failure} failure never downgrades to ordinary input despite form support`, async () => {
+  const phone = new PrivatePhone(kind === 'private' ? privateApproval() : extensionApproval())
+  const h = await harness(phone, { formSupport: true,
+    ...(failure === 'directory' ? { secretFilesDir: '/does-not-exist' } : {}),
+    ...(failure === 'connect' ? { connect: async () => { throw new Error('DO_NOT_LEAK CANARY_failure') } } : {}),
+    respond: () => ({ isError: true, content: [{ type: 'text', text: 'DO_NOT_LEAK CANARY_failure' }] }),
+  })
+  try {
+    await fallback(h)
+    assert.deepEqual(h.formRequests, [])
+    assert.deepEqual(phone.answers, [])
+    assert.deepEqual(phone.declines, [])
+    assert.doesNotMatch(JSON.stringify(h.updates), /DO_NOT_LEAK|CANARY_/)
+  } finally { await h.close() }
+})
+
+test('ordinary secret storage refuses an OTP-length value rather than changing its destination', async () => {
+  const phone = new PrivatePhone(privateApproval(storeSecret, 'secret_request'))
+  const h = await harness(phone, { server: false, formSupport: true, ordinaryRespond: params => 'collection' in params.requestedSchema.properties
+    ? continueOrdinary : { action: 'accept', content: { value: '001234' } } })
+  try { await fallback(h); assert.deepEqual(phone.answers, []); assert.deepEqual(phone.declines, []); assert.equal(h.formRequests.length, 2) } finally { await h.close() }
 })

@@ -59,7 +59,7 @@ export const labelOf = (option: z.infer<typeof optionSchema>) => typeof option =
 
 const phoneOnlyReasons = {
   schema: 'This interview has unsupported or malformed questions, fields or rich content.',
-  private: 'This interview requests sensitive input, but the private-input helper or owner-checked phone submission is unavailable.',
+  private: 'This interview requests sensitive input, but supported collection or owner-checked phone submission is unavailable.',
   media: 'This interview needs phone-only media, Markdown rendering, local links or source-layout features.',
   draft: 'This interview already has a saved phone draft or helper conversation; it will not be replaced.',
   state: 'This interview ended or changed, or its question metadata does not match.',

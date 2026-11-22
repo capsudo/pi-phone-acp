@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import * as acp from '@agentclientprotocol/sdk/unstable'
 import type { PhoneBackend, PhoneEvent, PhoneSession } from './phone.js'
+import { forwardOrdinarySensitive } from './ordinary-input.js'
 import { forwardInteractive } from './interactive.js'
 import { PhoneOnlyInterview, supportedSecretAsk } from './forms.js'
 import { defaultSecretFiles, forwardPrivate, forwardSecretAsk } from './private-input.js'
@@ -101,10 +102,10 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
       if (item.interactive) {
         const secretAsk = supportedSecretAsk(item.form)
         const privateInput = item.privateForm !== undefined || secretAsk !== undefined
-        const supported = item.privateForm ? attached.privateMcp && !!phone.privateFormCurrent && !!phone.answerPrivate && !!phone.declinePrivate
-          : secretAsk ? attached.privateMcp && !!phone.secretAskCurrent && !!phone.answerSecretAsk && !!phone.declineSecretAsk : formSupported
+        const supported = item.privateForm ? (attached.privateMcp || formSupported) && !!phone.privateFormCurrent && !!phone.answerPrivate && !!phone.declinePrivate
+          : secretAsk ? (attached.privateMcp || formSupported) && !!phone.secretAskCurrent && !!phone.answerSecretAsk && !!phone.declineSecretAsk : formSupported
         if (!supported || (!item.form && !privateInput) || !attached.prompt?.started) {
-          const reason = privateInput && !supported ? 'The dedicated T3 private-input helper or phone consumer is unavailable.'
+          const reason = privateInput && !supported ? 'This client lacks a supported input method, or the checked phone consumer is unavailable.'
             : !privateInput && !formSupported ? 'This client did not advertise form support.'
               : !attached.prompt?.started ? 'T3 needs an active prompt turn to show forms; reconnect replay is observation only.'
                 : 'This form is sensitive, unknown or malformed, or requires saved phone sign-in choices.'
@@ -119,10 +120,12 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
         attached.formQueue = attached.formQueue.then(async () => {
           try {
             if (questionSignal.aborted) return
-            const result = item.privateForm
-              ? await forwardPrivate(phone, id, { ...item, privateForm: item.privateForm }, client, questionSignal, secretFiles, options.secretTimeoutMs)
-              : secretAsk ? await forwardSecretAsk(phone, id, { ...item, form: secretAsk }, client, questionSignal, secretFiles, options.secretTimeoutMs)
-                : await forwardInteractive(phone, id, item, client, questionSignal, { privateMcp: attached.privateMcp, secretFiles, secretTimeoutMs: options.secretTimeoutMs })
+            const result = privateInput && !attached.privateMcp
+              ? await forwardOrdinarySensitive(phone, id, item, client, questionSignal, { formSupported, privateMcp: attached.privateMcp })
+              : item.privateForm
+                ? await forwardPrivate(phone, id, { ...item, privateForm: item.privateForm }, client, questionSignal, secretFiles, options.secretTimeoutMs)
+                : secretAsk ? await forwardSecretAsk(phone, id, { ...item, form: secretAsk }, client, questionSignal, secretFiles, options.secretTimeoutMs)
+                  : await forwardInteractive(phone, id, item, client, questionSignal, { privateMcp: attached.privateMcp, formSupported, secretFiles, secretTimeoutMs: options.secretTimeoutMs })
             if (result === 'phone' && !questionSignal.aborted) await notice(id, '[Interactive question remains on the phone. Complete it in pi-phone. No answer was sent automatically.]', client, 'Complete this question in pi-phone')
           } catch (error) {
             // Even validation exceptions can include answer/credential contents.

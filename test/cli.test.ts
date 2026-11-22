@@ -137,3 +137,62 @@ test('compiled stdio private card uses the configured exact directory and posts 
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+for (const completion of ['submit', 'phone', 'decline']) test(`compiled stdio ordinary sensitive ${completion} warns before entry and preserves the native request`, { timeout: 15000 }, async () => {
+  const fixture = await new PhoneFixture().start()
+  const directory = await mkdtemp(join(tmpdir(), 'pi-phone-ordinary-stdio-'))
+  const tokenFile = join(directory, 'token')
+  await writeFile(tokenFile, fixture.token, { mode: 0o600 })
+  let forms = 0
+  const child = launch({ ...process.env, PI_PHONE_URL: fixture.url.origin, PI_PHONE_TOKEN_FILE: tokenFile, PI_PHONE_SECRET_FILES_DIR: join(directory, 'not-needed') }, peer => peer
+    .onRequest(acp.methods.client.elicitation.create, ({ params }) => {
+      forms++
+      assert.equal(params.mode, 'form')
+      assert.ok('requestedSchema' in params)
+      const schema = params.requestedSchema as { properties: Record<string, { description?: string }>, required: string[] }
+      assert.match(params.message, /not private delivery/)
+      if (forms === 1) {
+        assert.deepEqual(Object.keys(schema.properties), ['collection'])
+        assert.match(schema.properties.collection!.description!, /Masking depends on the ADE/)
+        return { action: 'accept', content: { collection: completion === 'phone' ? 'Complete in pi-phone' : 'Continue with ordinary input' } }
+      }
+      assert.equal(forms, 2)
+      assert.deepEqual(schema.required, ['code'])
+      assert.match(schema.properties.code!.description!, /visible and retained in ADE history or logs/)
+      return completion === 'decline' ? { action: 'decline' } : { action: 'accept', content: { code: '001234' } }
+    })
+    .onRequest('*', () => { assert.fail('No private helper or permission request expected') }))
+  try {
+    await child.agent.request(acp.methods.agent.initialize, { protocolVersion: 2, clientCapabilities: { elicitation: { form: {} }, session: { notices: {} } } })
+    const { sessionId } = await child.agent.request(acp.methods.agent.session.new, { cwd: '/t3/project', mcpServers: [] })
+    const prompt = child.agent.request(acp.methods.agent.session.prompt, { sessionId, prompt: [{ type: 'text', text: 'Fixture ordinary code' }] })
+    await fixture.submitted.promise
+    fixture.conversations.get(Number(sessionId))!.approvals = privateView().approvals!
+    fixture.publish(Number(sessionId))
+    if (completion !== 'submit') {
+      const deadline = Date.now() + 3000
+      while (completion === 'phone' ? !child.updates.some(update => update.update.sessionUpdate === 'notice') : fixture.answers.length === 0) {
+        assert.ok(Date.now() < deadline, 'Ordinary request did not settle')
+        await new Promise(resolve => setTimeout(resolve, 1))
+      }
+      assert.deepEqual(fixture.privateAnswers, [])
+      if (completion === 'phone') assert.deepEqual(fixture.answers, [])
+      fixture.conversations.get(Number(sessionId))!.approvals = []
+      fixture.finish(Number(sessionId), 'Completed in the fake phone.')
+    }
+    assert.equal((await prompt).stopReason, 'end_turn')
+    assert.equal(forms, completion === 'phone' ? 1 : 2)
+    assert.deepEqual(fixture.privateAnswers, completion === 'submit' ? [{ path: '/api/browser/asks/risky-17-call-1', body: { values: { code: '001234' }, remember: false, useSaved: false } }] : [])
+    assert.deepEqual(fixture.answers, completion === 'decline' ? [{ id: 'risky-17-call-1', allow: false }] : [])
+    assert.equal(fixture.aborts, 0)
+    child.child.stdin.end()
+    assert.equal(await child.exited, 0)
+    assert.equal(child.errors(), '')
+    assert.doesNotMatch(child.output() + child.errors() + JSON.stringify(child.updates), /001234|test-only-device-session/)
+  } finally {
+    child.connection.close()
+    if (child.child.exitCode === null) child.child.kill('SIGKILL')
+    await fixture.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
