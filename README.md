@@ -34,12 +34,22 @@ Both the computer running the ADE and the android phone must be on the **same Ta
 ## Features
 
 - **Approvals:** Allow or deny phone action requests directly from the ADE.
-- **Extension questions:** Answer questions and text-entry forms from phone extensions.
+- **Extension questions:** Answer questions and text-entry forms from pi-phone extensions.
 - **Interviews:** Complete text and choice questionnaires, with multiple selections, notes, optional questions and final confirmation.
 - **Rich context:** View code snippets, formatted Markdown, tables and option descriptions alongside questions.
 - **Markdown source:** Display literal when requested (such as `**bold**` instead of rendered formatting).
-- **Secrets input:** Enter passwords and security codes in masked prompts for secret requests and browser or computer sign-in.
+- **Secrets input<sup>*</sup>:** Enter passwords and security codes in **masked prompts** for the following requests:
+    - [x] Secret storage — prompts to save a secret in pi-phone Settings → Secrets.
+    - [x] Browser sign-in — prompts to fill username/password fields in pi-phone's browser.
+    - [x] Browser security code — prompts to fill a security-code field in pi-phone's browser.
+    - [x] Desktop app sign-in — prompts to fill sign-in fields in a desktop app via remote computer control. [live test failed]
+    - [ ] Chrome Remote Desktop setup — prompts for Google’s connection command and remote-access PIN.
+    - [ ] Extension Forms secret fields — prompts from extensions for fields with `secret: true`.
+    - [ ] Credential prompts within interviews.
+    > Unchecked items are not yet forwarded, even as regular prompts. These requests must be answered on the phone.
 - **Rich-content fallback:** Forms containing images, interactive previews or other unsupported content stay on the phone, with a notice in the ADE rather than an incomplete form.
+
+_<sup>*</sup> T3 Code only_
 
 Targets the pi-phone **build-508** interface (`c59e0ceb993dc0ded331eeb6758f86bbaed75cec`); used with **T3 Code 0.1.8** (ACP v1).
 
@@ -90,6 +100,8 @@ After separately approving provider setup, T3 can use a **Local ACP command** wi
 
 - T3 stores ordinary form answers in history and trims outer whitespace from both ordinary and private input.
 - Interrupted secret-file delivery can leave a temporary file for T3's existing cleanup.
+- T3 Masked input is used (among other requests) for A. requests to fill secret fields in Extension Forms and B. credential prompts within interviews but this can give a misleading impression of protection since for A. nothing guarantes that the extension handle those safely and B. the interview "answer" (all the values user has chosen) is sent back to the LLM in plain sight.
+
 
 ## Development checks
 
