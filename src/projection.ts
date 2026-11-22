@@ -1,6 +1,6 @@
 import { riskyApprovalFormSchema, type Entry, type View } from './contract.js'
 import type { PhoneEvent } from './phone.js'
-import { askFormSchema, interviewFormSchema, privateAsk } from './forms.js'
+import { askFormSchema, interviewFormSchema, privateAsk, supportedSecretAsk } from './forms.js'
 import { supportedPrivateForm } from './private-forms.js'
 
 /** Deduplicates committed entries and tool snapshots, not unreliable SSE cursors. */
@@ -63,7 +63,7 @@ export class Projection {
     for (const approval of view.approvals ?? []) {
       const ask = askFormSchema.safeParse(approval.form)
       const interview = interviewFormSchema.safeParse(approval.form)
-      const form = ask.success && !privateAsk(ask.data) ? ask.data
+      const form = ask.success && (!privateAsk(ask.data) || supportedSecretAsk(ask.data) !== undefined) ? ask.data
         : interview.success && (approval.callId === undefined || approval.callId === interview.data.callId) ? interview.data : undefined
       const privateForm = supportedPrivateForm(approval.form, approval.tool)
       const risky = riskyApprovalFormSchema.safeParse(approval.form)

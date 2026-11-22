@@ -11,6 +11,10 @@ export const askFormSchema = z.strictObject({
   })).max(6),
 }).refine(form => new Set(form.fields.map(field => field.name)).size === form.fields.length)
 export type AskForm = z.infer<typeof askFormSchema>
+export function supportedSecretAsk(raw: unknown): AskForm | undefined {
+  const result = askFormSchema.safeParse(raw)
+  return result.success && result.data.fields.some(field => field.secret === true) ? result.data : undefined
+}
 export const interviewFormSchema = z.strictObject({
   type: z.literal('interview'), callId: z.string().min(1), title: z.string(), count: z.number().int().nonnegative(),
 })

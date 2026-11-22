@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { askValues, supportedSecretAsk } from '../src/forms.js'
+import type { SecretAskApproval } from '../src/phone.js'
 import { privateFields, privateValues, supportedPrivateForm } from '../src/private-forms.js'
 import { Projection } from '../src/projection.js'
 import { browserCode, browserLogin, computerLogin, storeSecret, privateCases, privateView, privateApproval } from './private-fixture.js'
@@ -84,7 +86,7 @@ test('keeps saved sign-ins, generic sensitive asks, malformed and unknown privat
     [{ ...browserLogin, fields: [...browserLogin.fields, ...browserCode.fields] }, 'browser_sign_in'],
     [{ ...storeSecret, name: 'not-valid' }, 'secret_request'],
     [browserCode, 'ask'],
-    [{ type: 'ask', title: 'Password', fields: [{ name: 'password', label: 'Password', secret: true }], submit: 'Send' }, 'ask'],
+    [{ type: 'ask', title: 'Password', fields: [{ name: 'password', label: 'Password' }], submit: 'Send' }, 'ask'],
   ] as const) {
     const [item] = new Projection().consume(privateView(form, tool))
     assert.ok(item?.type === 'approval')
@@ -131,4 +133,83 @@ test('private Decline is refused for changed identity/ownership and never retrie
   await assert.rejects(phone.declinePrivate('1', privateApproval(), new AbortController().signal))
   assert.equal(state.posts.length, 1)
   assert.deepEqual(state.posts[0]!.body, { allow: false })
+})
+
+const secretAsk = {
+  type: 'ask', title: 'Extension details', submit: 'Send', fields: [
+    { name: 'account', label: 'Account' }, { name: 'key', label: 'Access key', secret: true },
+  ],
+}
+function secretAskApproval(): SecretAskApproval {
+  const item = new Projection().consume(privateView(secretAsk, 'extension_question'))[0]
+  assert.ok(item?.type === 'approval' && item.form?.type === 'ask')
+  return { ...item, form: item.form }
+}
+
+test('secret:true selects private extension collection without treating the extension as a dedicated private consumer', () => {
+  const item = secretAskApproval()
+  assert.deepEqual(item.form, secretAsk)
+  assert.equal(item.privateForm, undefined)
+  assert.equal(item.interactive, true)
+  assert.equal(item.tool, 'extension_question')
+  assert.deepEqual(supportedSecretAsk(secretAsk), secretAsk)
+  assert.deepEqual(askValues(item.form, { account: ' dummy ', key: '001234' }), { account: ' dummy ', key: '001234' })
+  for (const raw of [
+    { ...secretAsk, fields: [{ name: 'key', label: 'Key', secret: false }] },
+    { ...secretAsk, fields: [] },
+    { ...secretAsk, fields: [...secretAsk.fields, secretAsk.fields[0]] },
+    { ...secretAsk, fields: [{ name: 'key', label: 'Key', secret: 'true' }] },
+    { ...secretAsk, unknown: true },
+    { ...secretAsk, fields: Array.from({ length: 7 }, (_, index) => ({ name: `field${index}`, label: 'Field', secret: true })) },
+  ]) assert.equal(supportedSecretAsk(raw), undefined)
+})
+
+test('secret extension answers use the native ask route and exact named strings, not secret storage or sign-in routes', async () => {
+  const { state, phone } = httpFixture(secretAsk, 'extension_question')
+  const item = secretAskApproval()
+  const signal = new AbortController().signal
+  assert.equal(await phone.secretAskCurrent('1', item, signal), true)
+  await phone.answerSecretAsk('1', item, { account: ' dummy ', key: '001234' }, signal)
+  assert.deepEqual(state.posts, [{ path: `/api/asks/${item.id}`, body: { values: { account: ' dummy ', key: '001234' } } }])
+})
+
+for (const change of ['withdraw', 'id', 'conversation', 'tool', 'call', 'form', 'secret-flag', 'role', 'team']) {
+  test(`secret extension ${change} revalidation blocks both submission and Decline`, async () => {
+    const { state, phone } = httpFixture(secretAsk, 'extension_question')
+    const item = secretAskApproval()
+    const current = state.view.approvals![0]!
+    if (change === 'withdraw') state.view.approvals = []
+    else if (change === 'id') current.id = 'replacement'
+    else if (change === 'conversation') current.conversationId = 2
+    else if (change === 'tool') current.tool = 'replacement'
+    else if (change === 'call') current.callId = 'replacement'
+    else if (change === 'form') current.form = { ...secretAsk, title: 'Changed' }
+    else if (change === 'secret-flag') current.form = { ...secretAsk, fields: secretAsk.fields.map(field => ({ ...field, secret: false })) }
+    else if (change === 'role') state.role = 'guest'
+    else state.team = true
+    const signal = new AbortController().signal
+    assert.equal(await phone.secretAskCurrent('1', item, signal), false)
+    await assert.rejects(phone.answerSecretAsk('1', item, { account: 'dummy', key: 'CANARY_key' }, signal))
+    await assert.rejects(phone.declineSecretAsk('1', item, signal))
+    assert.deepEqual(state.posts, [])
+  })
+}
+
+test('secret extension backend rejects missing, extra and oversized values before attempting a write', async () => {
+  const { state, phone } = httpFixture(secretAsk, 'extension_question')
+  const item = secretAskApproval()
+  for (const values of [{ key: 'dummy' }, { account: 'dummy', key: '' }, { account: 'dummy', key: 'x'.repeat(4097) }, { account: 'dummy', key: 'dummy', extra: 'dummy' }]) {
+    await assert.rejects(phone.answerSecretAsk('1', item, values as Record<string, string>, new AbortController().signal))
+  }
+  assert.deepEqual(state.posts, [])
+})
+
+for (const decline of [false, true]) test(`secret extension ${decline ? 'Decline' : 'answer'} is attempted once and keeps slashes inside the request ID`, async () => {
+  const { state, phone } = httpFixture(secretAsk, 'extension_question')
+  const item = secretAskApproval()
+  item.id = state.view.approvals![0]!.id = 'extension/request/1'
+  state.fail = true
+  const signal = new AbortController().signal
+  await assert.rejects(decline ? phone.declineSecretAsk('1', item, signal) : phone.answerSecretAsk('1', item, { account: 'dummy', key: '001234' }, signal))
+  assert.deepEqual(state.posts, [{ path: `/api/${decline ? 'approvals' : 'asks'}/extension%2Frequest%2F1`, body: decline ? { allow: false } : { values: { account: 'dummy', key: '001234' } } }])
 })

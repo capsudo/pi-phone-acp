@@ -6,8 +6,10 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import * as acp from '@agentclientprotocol/sdk/unstable'
 import { createAdapter } from '../src/adapter.js'
+import { Projection } from '../src/projection.js'
+import { forwardSecretAsk } from '../src/private-input.js'
 import { SecretFiles } from '../src/secret-files.js'
-import type { PhoneBackend, PhoneEvent, PrivateApproval } from '../src/phone.js'
+import type { PhoneBackend, PhoneEvent, PrivateApproval, SecretAskApproval } from '../src/phone.js'
 import { browserCode, browserLogin, computerLogin, privateApproval, privateView, storeSecret } from './private-fixture.js'
 import { HttpPhoneBackend } from '../src/backend.js'
 import { PhoneHttp } from '../src/http.js'
@@ -33,7 +35,7 @@ class PrivatePhone implements PhoneBackend {
   failAnswer = false
   asyncMode = false
   replay = false
-  constructor(readonly approval = privateApproval()) {}
+  constructor(readonly approval: Extract<PhoneEvent, { type: 'approval' }> = privateApproval()) {}
   async create() { return { id: '1', history: [] } }
   async load() { return { id: '1', history: [], replay: [this.approval] } }
   async *run(_id: string, _text: string, _request: string, signal: AbortSignal): AsyncGenerator<PhoneEvent> {
@@ -66,9 +68,25 @@ class PrivatePhone implements PhoneBackend {
     if (this.failAnswer) throw new Error('DO_NOT_LEAK uncertain POST')
     this.ended.resolve()
   }
+  async secretAskCurrent(_id: string, _approval: SecretAskApproval, signal: AbortSignal) { signal.throwIfAborted(); this.checks++; return !this.changed }
+  async answerSecretAsk(id: string, approval: SecretAskApproval, values: Record<string, string>, signal: AbortSignal) {
+    if (!await this.secretAskCurrent(id, approval, signal)) throw new Error('DO_NOT_LEAK changed extension request')
+    signal.throwIfAborted()
+    this.answers.push({ ...values }); this.posted.resolve()
+    if (this.failAnswer) throw new Error('DO_NOT_LEAK uncertain extension POST')
+    this.ended.resolve()
+  }
+  async declineSecretAsk(id: string, approval: SecretAskApproval, signal: AbortSignal) {
+    if (!await this.secretAskCurrent(id, approval, signal)) throw new Error('DO_NOT_LEAK changed extension request')
+    signal.throwIfAborted()
+    this.declines.push(approval.id)
+    if (this.failDecline) throw new Error('DO_NOT_LEAK uncertain extension decline')
+    this.ended.resolve()
+  }
   withdraw() { this.changed = true; this.extra.push({ type: 'approval_withdrawn', id: this.approval.id }); this.wake.resolve() }
 }
 interface HarnessOptions {
+  formSupport?: boolean
   server?: boolean
   backend?: PhoneBackend
   secretFilesDir?: string
@@ -84,6 +102,7 @@ async function harness(phone = new PrivatePhone(), options: HarnessOptions = {})
   const requests: { method: string, params: Record<string, unknown> }[] = []
   const updates: acp.SessionNotification[] = []
   let cards = 0
+  let ordinaryRequests = 0
   let disconnects = 0
   let initialized = false
   const save = async (value: string) => {
@@ -93,8 +112,8 @@ async function harness(phone = new PrivatePhone(), options: HarnessOptions = {})
     return { isError: false, structuredContent: result, content: [{ type: 'text', text: JSON.stringify(result) }] }
   }
   const client = acp.client()
-    .onRequest(acp.methods.client.elicitation.create, () => { assert.fail('Secrets must never enter ordinary elicitation') })
-    .onRequest(acp.methods.client.session.requestPermission, () => { assert.fail('Secrets must never enter permission UI') })
+    .onRequest(acp.methods.client.elicitation.create, () => { ordinaryRequests++; assert.fail('Secrets must never enter ordinary elicitation') })
+    .onRequest(acp.methods.client.session.requestPermission, () => { ordinaryRequests++; assert.fail('Secrets must never enter permission UI') })
     // Installed T3's legacy connectionId-based carrier is different from the
     // SDK's current serverId/requestId carrier; handle its raw wire here.
     .onRequest('*', async ({ method, params }) => {
@@ -123,14 +142,14 @@ async function harness(phone = new PrivatePhone(), options: HarnessOptions = {})
     .onNotification(acp.methods.client.session.update, ({ params }) => { updates.push(params) })
   const connection = client.connect(createAdapter(options.backend ?? phone, { secretFiles: new SecretFiles(options.secretFilesDir ?? directory), secretTimeoutMs: 1000 }))
   const agent = connection.agent
-  await agent.request(acp.methods.agent.initialize, { protocolVersion: 2 }) // No ordinary form capability needed.
+  await agent.request(acp.methods.agent.initialize, { protocolVersion: 2, ...(options.formSupport ? { clientCapabilities: { elicitation: { form: {} } } } : {}) }) // No ordinary form capability needed.
   const workspace = { cwd: '/t3/project', mcpServers: options.server === false ? [] : [{ type: 'acp' as const, name: 't3-code', serverId: 't3-code' }] }
   await agent.request(acp.methods.agent.session.new, workspace)
   const result = agent.request(acp.methods.agent.session.prompt, { sessionId: '1', prompt: [{ type: 'text', text: 'Fixture private request' }] })
   void result.catch(() => {})
   return { phone, agent, connection, result, requests, updates, files, directory, workspace, save,
     disconnects: () => disconnects,
-    close: async () => { connection.close(); await rm(base, { recursive: true, force: true }) } }
+    close: async () => { connection.close(); await rm(base, { recursive: true, force: true }); assert.equal(ordinaryRequests, 0, 'Private collection must not open ordinary forms or permission UI') } }
 }
 async function fallback(h: Awaited<ReturnType<typeof harness>>) {
   await until(() => h.updates.some(update => JSON.stringify(update).includes('phone')))
@@ -498,5 +517,234 @@ test('a Decline result arriving after local cancellation must not reject the nat
     await tick(); await tick()
     assert.deepEqual(h.phone.declines, [])
     assert.deepEqual(h.phone.answers, [])
+  } finally { await h.close() }
+})
+
+const extensionForm = {
+  type: 'ask', title: 'Extension account', text: 'Enter dummy extension details.', submit: 'Send details',
+  fields: [
+    { name: 'account', label: 'Account name', placeholder: 'Dummy name' },
+    { name: 'accessKey', label: 'Access key', secret: true, autocomplete: 'new-password' },
+  ],
+}
+function extensionApproval(form: unknown = extensionForm): SecretAskApproval {
+  const event = new Projection().consume(privateView(form, 'extension_question'))[0]
+  assert.ok(event?.type === 'approval' && event.form?.type === 'ask')
+  return { ...event, form: event.form }
+}
+
+for (const fields of [extensionForm.fields, [extensionForm.fields[1]!], Array.from({ length: 6 }, (_, index) => ({ name: `field${index}`, label: `Field ${index}`, secret: index === 5 }))]) {
+  test(`secret extension forms collect all ${fields.length} named fields privately, then submit once`, async () => {
+    const phone = new PrivatePhone(extensionApproval({ ...extensionForm, fields }))
+    const values = fields.map((_, index) => index === fields.length - 1 ? '001234' : 'CANARY_extension_account')
+    const h = await harness(phone, { formSupport: true, respond: async (index, save) => {
+      assert.deepEqual(phone.answers, [])
+      assert.deepEqual(await readdir(h.directory), [])
+      return save(values[index]!)
+    } })
+    try {
+      await h.result
+      assert.deepEqual(phone.answers, [Object.fromEntries(fields.map((field, index) => [field.name, values[index]]))])
+      assert.equal(phone.checks, 2)
+      assert.equal(h.disconnects(), 1)
+      assert.deepEqual(await readdir(h.directory), [])
+      assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.updates), /CANARY_|001234/)
+      const cards = h.requests.filter(request => request.params.method === 'tools/call')
+      assert.equal(cards.length, fields.length)
+      for (const [index, card] of cards.entries()) {
+        const args = (card.params.params as { arguments: Record<string, unknown> }).arguments
+        assert.equal(args.label, `${fields[index]!.label} (${index + 1}/${fields.length})`)
+        assert.match(String(args.reason), /Extension account/)
+        assert.match(String(args.reason), /Submit action: Send details/)
+        assert.match(String(args.reason), /developer determines whether they are saved or returned/)
+        assert.match(String(args.reason), /Private entry does not make that later use private/)
+      }
+    } finally { await h.close() }
+  })
+}
+
+test('extension values keep native string semantics, including newlines and outer whitespace delivered by the helper', async () => {
+  const phone = new PrivatePhone(extensionApproval())
+  const h = await harness(phone, { respond: (index, save) => save(index ? ' CANARY_extension\nvalue ' : 'dummy') })
+  try {
+    await h.result
+    assert.deepEqual(phone.answers, [{ account: 'dummy', accessKey: ' CANARY_extension\nvalue ' }])
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.updates), /CANARY_/)
+  } finally { await h.close() }
+})
+
+for (const status of ['declined', 'cancelled', 'timed_out']) test(`extension ${status} after one collected field sends no partial values`, async () => {
+  const phone = new PrivatePhone(extensionApproval())
+  const h = await harness(phone, { respond: (index, save) => index === 0 ? save('CANARY_extension_partial') : {
+    isError: false, structuredContent: { status }, content: [{ type: 'text', text: JSON.stringify({ status }) }],
+  } })
+  try {
+    if (status === 'declined') await h.result
+    else await fallback(h)
+    assert.deepEqual(phone.answers, [])
+    assert.deepEqual(phone.declines, status === 'declined' ? [phone.approval.id] : [])
+    assert.equal(phone.stops, 0)
+    assert.equal(h.disconnects(), 1)
+    assert.deepEqual(await readdir(h.directory), [])
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.updates), /CANARY_/)
+  } finally { await h.close() }
+})
+
+for (const mode of ['no-helper', 'changed', 'missing-handler', 'invalid-directory']) test(`secret extension ${mode} stays on the phone without opening ordinary fields`, async () => {
+  const phone = new PrivatePhone(extensionApproval())
+  phone.changed = mode === 'changed'
+  const h = await harness(phone, {
+    formSupport: true, server: mode !== 'no-helper',
+    ...(mode === 'missing-handler' ? { backend: Object.assign(phone, { answerSecretAsk: undefined }) as PhoneBackend } : {}),
+    ...(mode === 'invalid-directory' ? { secretFilesDir: 'relative/not-allowed' } : {}),
+  })
+  try {
+    await fallback(h)
+    assert.deepEqual(h.requests, [])
+    assert.deepEqual(phone.answers, [])
+    assert.deepEqual(phone.declines, [])
+  } finally { await h.close() }
+})
+
+for (const mode of ['changed', 'uncertain-answer', 'uncertain-decline', 'helper-error', 'malformed-reply', 'bad-permissions', 'empty', 'oversize']) {
+  test(`secret extension ${mode} prevents resubmission and keeps failures secret-free`, async () => {
+    const phone = new PrivatePhone(extensionApproval())
+    phone.failAnswer = mode === 'uncertain-answer'
+    phone.failDecline = mode === 'uncertain-decline'
+    const h = await harness(phone, { formSupport: true, respond: async (index, save) => {
+      if (index === 0) return save('CANARY_extension_partial')
+      if (mode === 'changed') phone.changed = true
+      if (mode === 'uncertain-decline') return { isError: false, structuredContent: { status: 'declined' }, content: [{ type: 'text', text: '{"status":"declined"}' }] }
+      if (mode === 'helper-error') throw new Error('DO_NOT_LEAK helper failure')
+      const reply = await save(mode === 'empty' ? '' : mode === 'oversize' ? 'x'.repeat(4097) : 'CANARY_extension_value') as { isError: boolean, structuredContent: { file: string } }
+      if (mode === 'malformed-reply') reply.isError = true
+      if (mode === 'bad-permissions') await chmod(reply.structuredContent.file, 0o644)
+      return reply
+    } })
+    try {
+      await fallback(h)
+      assert.equal(phone.answers.length, mode === 'uncertain-answer' ? 1 : 0)
+      assert.equal(phone.declines.length, mode === 'uncertain-decline' ? 1 : 0)
+      assert.equal(h.requests.filter(request => request.params.method === 'tools/call').length, 2)
+      assert.equal(h.disconnects(), 1)
+      assert.deepEqual(await readdir(h.directory), [])
+      assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.updates), /CANARY_|DO_NOT_LEAK|ZodError|EACCES/)
+    } finally { await h.close() }
+  })
+}
+
+for (const action of ['withdraw', 'cancel', 'disconnect']) test(`secret extension ${action} sends no answer or decline and cleans received files`, async () => {
+  const phone = new PrivatePhone(extensionApproval())
+  phone.asyncMode = action !== 'disconnect'
+  const pending = Promise.withResolvers<unknown>()
+  const asked = Promise.withResolvers<void>()
+  const h = await harness(phone, { respond: (index, save) => {
+    if (index === 0) return save('CANARY_extension_partial')
+    asked.resolve(); return pending.promise
+  } })
+  try {
+    await asked.promise
+    assert.deepEqual(await readdir(h.directory), [])
+    if (action === 'withdraw') phone.withdraw()
+    else if (action === 'cancel') await h.agent.notify(acp.methods.agent.session.cancel, { sessionId: '1' })
+    else h.connection.close()
+    await h.result.catch(error => { if (action !== 'disconnect') throw error })
+    // A disconnected transport cannot deliver a new path; only received files can be removed.
+    if (action === 'disconnect') pending.resolve({ isError: true, content: [] })
+    else pending.resolve(await h.save('CANARY_extension_late'))
+    for (let count = 0; count < 200; count++) {
+      if ((await readdir(h.directory)).length === 0) break
+      await new Promise(resolve => setTimeout(resolve, 1))
+    }
+    assert.deepEqual(await readdir(h.directory), [])
+    assert.deepEqual(phone.answers, [])
+    assert.deepEqual(phone.declines, [])
+    assert.equal(phone.stops, 0)
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.updates), /CANARY_/)
+  } finally { await h.close() }
+})
+
+test('secret extension replay remains observation-only without opening another password card', async () => {
+  const phone = new PrivatePhone(extensionApproval())
+  const h = await harness(phone)
+  try {
+    await h.result
+    const count = h.requests.length
+    await h.agent.request(acp.methods.agent.session.load, { ...h.workspace, sessionId: '1' })
+    assert.equal(h.requests.length, count)
+    assert.equal(phone.answers.length, 1)
+    assert.match(JSON.stringify(h.updates), /reconnect replay is observation only/)
+  } finally { await h.close() }
+})
+
+test('secret extension validation runs even when another backend bypasses Projection', async () => {
+  for (const form of [
+    { ...extensionForm, fields: [{ name: 'key', label: 'Key' }] },
+    { ...extensionForm, unknown: 'DO_NOT_LEAK' },
+    { ...extensionForm, fields: [...extensionForm.fields, extensionForm.fields[0]] },
+  ]) {
+    const item = { ...extensionApproval(), form } as SecretAskApproval
+    const phone = new PrivatePhone(item)
+    const client = { request: async () => { assert.fail('Unvalidated extension opened a card') } } as unknown as acp.AgentContext
+    assert.equal(await forwardSecretAsk(phone, '1', item, client, new AbortController().signal, new SecretFiles('/unused')), 'phone')
+    assert.equal(phone.checks, 0)
+    assert.deepEqual(phone.answers, [])
+  }
+})
+
+for (const uncertain of [false, true]) test(`secret extension real ACP + HTTP ${uncertain ? 'lost acknowledgement' : 'completion'} uses exactly one native ask POST`, async () => {
+  const fixture = await new PhoneFixture().start()
+  const answers: { path: string, body: unknown }[] = []
+  let ownerChecks = 0
+  let directory = ''
+  const request: typeof fetch = async (input, init) => {
+    const url = new URL(String(input))
+    if (url.pathname === '/api/me') ownerChecks++
+    if (url.pathname.startsWith('/api/asks/')) {
+      assert.equal(init?.method, 'POST')
+      assert.deepEqual(await readdir(directory), [])
+      answers.push({ path: url.pathname, body: JSON.parse(String(init?.body)) })
+      if (uncertain) throw new Error('DO_NOT_LEAK uncertain CANARY_http_extension')
+      fixture.conversations.get(1)!.approvals = []
+      fixture.finish(1, 'Extension completed.')
+      return Response.json({ ok: true })
+    }
+    return fetch(input, init)
+  }
+  const backend = new HttpPhoneBackend(new PhoneHttp(fixture.url, fixture.token, request), '/phone/work', 0)
+  const h = await harness(new PrivatePhone(), { backend, respond: (index, save) => save(index ? '001234' : 'CANARY_http_extension') })
+  directory = h.directory
+  try {
+    await fixture.submitted.promise
+    const native = privateView(extensionForm, 'extension_question').approvals![0]!
+    native.id = 'extension/request/1'; native.callId = 'extension/call/1'
+    fixture.conversations.get(1)!.approvals = [native]
+    fixture.publish(1)
+    if (uncertain) {
+      await until(() => h.updates.some(update => JSON.stringify(update).includes('no automatic retry')))
+      fixture.conversations.get(1)!.approvals = []
+      fixture.finish(1, 'Complete after phone inspection.')
+    }
+    await h.result
+    assert.equal(ownerChecks, 2)
+    assert.deepEqual(answers, [{ path: '/api/asks/extension%2Frequest%2F1', body: { values: { account: 'CANARY_http_extension', accessKey: '001234' } } }])
+    assert.deepEqual(fixture.privateAnswers, [])
+    assert.deepEqual(fixture.answers, [])
+    assert.equal(fixture.aborts, 0)
+    assert.equal(h.disconnects(), 1)
+    assert.deepEqual(await readdir(h.directory), [])
+    assert.doesNotMatch(JSON.stringify(h.requests) + JSON.stringify(h.updates), /CANARY_|001234|DO_NOT_LEAK/)
+  } finally { await h.close(); await fixture.close() }
+})
+
+test('an invalid first extension value stops collection before the next password card', async () => {
+  const phone = new PrivatePhone(extensionApproval())
+  const h = await harness(phone, { respond: (_index, save) => save('x'.repeat(4097)) })
+  try {
+    await fallback(h)
+    assert.equal(h.requests.filter(request => request.params.method === 'tools/call').length, 1)
+    assert.deepEqual(phone.answers, [])
+    assert.deepEqual(phone.declines, [])
+    assert.deepEqual(await readdir(h.directory), [])
   } finally { await h.close() }
 })

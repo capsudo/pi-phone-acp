@@ -3,8 +3,8 @@ import { isAbsolute } from 'node:path'
 import * as acp from '@agentclientprotocol/sdk/unstable'
 import type { PhoneBackend, PhoneEvent, PhoneSession } from './phone.js'
 import { forwardInteractive } from './interactive.js'
-import { PhoneOnlyInterview } from './forms.js'
-import { defaultSecretFiles, forwardPrivate } from './private-input.js'
+import { PhoneOnlyInterview, supportedSecretAsk } from './forms.js'
+import { defaultSecretFiles, forwardPrivate, forwardSecretAsk } from './private-input.js'
 import type { SecretFiles } from './secret-files.js'
 
 class LocalError extends acp.RequestError {}
@@ -99,8 +99,10 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
       if (attached.prompt?.cancelRequested || attached.approvals.has(item.id)) return
       attached.approvals.add(item.id)
       if (item.interactive) {
-        const privateInput = item.privateForm !== undefined
-        const supported = privateInput ? attached.privateMcp && !!phone.privateFormCurrent && !!phone.answerPrivate && !!phone.declinePrivate : formSupported
+        const secretAsk = supportedSecretAsk(item.form)
+        const privateInput = item.privateForm !== undefined || secretAsk !== undefined
+        const supported = item.privateForm ? attached.privateMcp && !!phone.privateFormCurrent && !!phone.answerPrivate && !!phone.declinePrivate
+          : secretAsk ? attached.privateMcp && !!phone.secretAskCurrent && !!phone.answerSecretAsk && !!phone.declineSecretAsk : formSupported
         if (!supported || (!item.form && !privateInput) || !attached.prompt?.started) {
           const reason = privateInput && !supported ? 'The dedicated T3 private-input helper or phone consumer is unavailable.'
             : !privateInput && !formSupported ? 'This client did not advertise form support.'
@@ -119,7 +121,8 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
             if (questionSignal.aborted) return
             const result = item.privateForm
               ? await forwardPrivate(phone, id, { ...item, privateForm: item.privateForm }, client, questionSignal, secretFiles, options.secretTimeoutMs)
-              : await forwardInteractive(phone, id, item, client, questionSignal)
+              : secretAsk ? await forwardSecretAsk(phone, id, { ...item, form: secretAsk }, client, questionSignal, secretFiles, options.secretTimeoutMs)
+                : await forwardInteractive(phone, id, item, client, questionSignal)
             if (result === 'phone' && !questionSignal.aborted) await notice(id, '[Interactive question remains on the phone. Complete it in pi-phone. No answer was sent automatically.]', client, 'Complete this question in pi-phone')
           } catch (error) {
             // Even validation exceptions can include answer/credential contents.

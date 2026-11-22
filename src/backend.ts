@@ -3,10 +3,10 @@ import { z } from 'zod'
 import { createdSchema, helloSchema, historySchema, pollSchema, submittedSchema, viewSchema } from './contract.js'
 import type { Entry, View } from './contract.js'
 import { PhoneHttp, PhoneHttpError } from './http.js'
-import type { PhoneBackend, PhoneEvent, PhoneSession, PrivateApproval } from './phone.js'
+import type { PhoneBackend, PhoneEvent, PhoneSession, PrivateApproval, SecretAskApproval } from './phone.js'
 import { privateValues, supportedPrivateForm } from './private-forms.js'
 import { Projection } from './projection.js'
-import type { ResponseItem } from './forms.js'
+import { askValues, supportedSecretAsk, type ResponseItem } from './forms.js'
 
 const okSchema = z.object({ ok: z.literal(true) })
 const nativeId = (id: string) => {
@@ -160,6 +160,37 @@ export class HttpPhoneBackend implements PhoneBackend {
   async answerAsk(id: string, values: Record<string, string>, signal: AbortSignal): Promise<void> {
     // Unlike /approvals, /asks validates and returns the named values to the asker.
     await this.http.json(`/api/asks/${encodeURIComponent(id)}`, okSchema, signal, { values })
+  }
+
+  async secretAskCurrent(id: string, approval: SecretAskApproval, signal: AbortSignal): Promise<boolean> {
+    const expected = supportedSecretAsk(approval.form)
+    if (!expected) return false
+    const hello = await this.http.json('/api/me', helloSchema, signal)
+    if (hello.user.role !== 'owner' || hello.user.team) return false
+    const stream = this.views(nativeId(id), signal)
+    try {
+      const { value: view } = await stream.next()
+      const current = view?.approvals?.find(item => item.id === approval.id)
+      if (!current || current.conversationId !== Number(id) || current.tool !== approval.tool || (current.callId ?? current.id) !== approval.callId) return false
+      const form = supportedSecretAsk(current.form)
+      return form !== undefined && JSON.stringify(form) === JSON.stringify(expected)
+    } finally { await stream.return(undefined) }
+  }
+
+  async answerSecretAsk(id: string, approval: SecretAskApproval, values: Record<string, string>, signal: AbortSignal): Promise<void> {
+    const form = supportedSecretAsk(approval.form)
+    if (!form) throw new Error('Unsupported secret extension form')
+    const checked = askValues(form, values)
+    if (!await this.secretAskCurrent(id, approval, signal)) throw new Error('Secret extension request changed')
+    signal.throwIfAborted()
+    // The extension receives the exact named strings. An uncertain POST is never retried.
+    await this.answerAsk(approval.id, checked, signal)
+  }
+
+  async declineSecretAsk(id: string, approval: SecretAskApproval, signal: AbortSignal): Promise<void> {
+    if (!await this.secretAskCurrent(id, approval, signal)) throw new Error('Secret extension request changed')
+    signal.throwIfAborted()
+    await this.answerApproval(approval.id, false, signal)
   }
 
   async privateFormCurrent(id: string, approval: PrivateApproval, signal: AbortSignal): Promise<boolean> {

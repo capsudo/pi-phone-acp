@@ -22,6 +22,8 @@ export type PhoneEvent =
 
 export type PrivateApproval = Extract<PhoneEvent, { type: 'approval' }> & { privateForm: PrivateForm }
 
+export type SecretAskApproval = Extract<PhoneEvent, { type: 'approval' }> & { form: AskForm }
+
 export interface PhoneBackend {
   create(signal: AbortSignal): Promise<PhoneSession>
   load(id: string, signal: AbortSignal): Promise<PhoneSession>
@@ -33,6 +35,9 @@ export interface PhoneBackend {
   cancel(id: string, requestId: string): Promise<void>
   answerApproval?(id: string, allow: boolean, signal: AbortSignal): Promise<void>
   answerAsk?(id: string, values: Record<string, string>, signal: AbortSignal): Promise<void>
+  secretAskCurrent?(id: string, approval: SecretAskApproval, signal: AbortSignal): Promise<boolean>
+  answerSecretAsk?(id: string, approval: SecretAskApproval, values: Record<string, string>, signal: AbortSignal): Promise<void>
+  declineSecretAsk?(id: string, approval: SecretAskApproval, signal: AbortSignal): Promise<void>
   privateFormCurrent?(id: string, approval: PrivateApproval, signal: AbortSignal): Promise<boolean>
   answerPrivate?(id: string, approval: PrivateApproval, values: Record<string, string>, signal: AbortSignal): Promise<void>
   declinePrivate?(id: string, approval: PrivateApproval, signal: AbortSignal): Promise<void>

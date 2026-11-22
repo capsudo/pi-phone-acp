@@ -3,8 +3,9 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { z } from 'zod'
 import type * as acp from '@agentclientprotocol/sdk/unstable'
-import type { PhoneBackend, PrivateApproval } from './phone.js'
+import type { PhoneBackend, PrivateApproval, SecretAskApproval } from './phone.js'
 import { privateFields, privateFieldValue, privateValues, supportedPrivateForm } from './private-forms.js'
+import { askValues, supportedSecretAsk } from './forms.js'
 import { SecretFiles } from './secret-files.js'
 
 const failed = () => new Error('Private input could not be forwarded; complete it on the phone. No automatic retry was attempted.')
@@ -153,6 +154,50 @@ export async function forwardPrivate(
     const checked = privateValues(form, values)
     // answerPrivate rechecks ownership and native request identity before its POST.
     await phone.answerPrivate(id, approval, checked, lifetime)
+    return 'done'
+  } catch { throw failed() }
+  finally {
+    lifetime.removeEventListener('abort', cancel)
+    await cards.close()
+    for (const key of Object.keys(values)) delete values[key]
+  }
+}
+
+/** Collect the whole extension form privately, including any unmarked companion fields. */
+export async function forwardSecretAsk(
+  phone: PhoneBackend, id: string, item: SecretAskApproval, client: acp.AgentContext, signal: AbortSignal,
+  files: SecretFiles, timeoutMs = 5 * 60_000,
+): Promise<'done' | 'phone'> {
+  const form = supportedSecretAsk(item.form)
+  if (!form || !files.supported || !phone.secretAskCurrent || !phone.answerSecretAsk || !phone.declineSecretAsk) return 'phone'
+  const approval = { ...item, form }
+  const values: Record<string, string> = Object.create(null) as Record<string, string>
+  const lifetime = AbortSignal.any([signal, AbortSignal.timeout(20 * 60_000)])
+  const cards = new SecretCards(client, files, lifetime)
+  const cancel = () => { void cards.close() }
+  try {
+    lifetime.throwIfAborted()
+    if (!await phone.secretAskCurrent(id, approval, lifetime)) return 'phone'
+    await cards.open()
+    lifetime.addEventListener('abort', cancel, { once: true })
+    lifetime.throwIfAborted()
+    for (const [index, field] of form.fields.entries()) {
+      lifetime.throwIfAborted()
+      const answer = await cards.answer(`${field.label} (${index + 1}/${form.fields.length})`,
+        [form.title, form.text, field.placeholder && `Hint: ${field.placeholder}`, `Submit action: ${form.submit}`,
+          'The requesting extension receives these answers. Its developer determines whether they are saved or returned to the phone model. Private entry does not make that later use private.',
+          `All ${form.fields.length} fields are collected before one submission. Required text; 1–4096 characters per field. Decline rejects this phone request without sending values. Cancel or timeout leaves it on the phone. T3 removes outer whitespace; use the phone when it matters.`,
+        ].filter(Boolean).join('\n\n'), timeoutMs)
+      lifetime.throwIfAborted()
+      if (answer.status === 'declined') {
+        await phone.declineSecretAsk(id, approval, lifetime)
+        return 'done'
+      }
+      if (answer.status !== 'saved') return 'phone'
+      values[field.name] = z.string().min(1).max(4096).parse(answer.value)
+    }
+    lifetime.throwIfAborted()
+    await phone.answerSecretAsk(id, approval, askValues(form, values), lifetime)
     return 'done'
   } catch { throw failed() }
   finally {

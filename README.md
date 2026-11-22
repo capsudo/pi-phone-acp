@@ -44,7 +44,7 @@ Both the computer running the ADE and the android phone must be on the **same Ta
     - [x] Browser security code — prompts to fill a security-code field in pi-phone's browser.
     - [x] Desktop app sign-in — prompts to fill sign-in fields in a desktop app via remote computer control. [live test failed]
     - [ ] Chrome Remote Desktop setup — prompts for Google’s connection command and remote-access PIN.
-    - [ ] Extension Forms secret fields — prompts from extensions for fields with `secret: true`.
+    - [x] Extension Forms secret fields — prompts from extensions for fields with `secret: true`.
     - [ ] Credential prompts within interviews.
     > Unchecked items are not yet forwarded, even as regular prompts. These requests must be answered on the phone.
 - **Rich-content fallback:** Forms containing images, interactive previews or other unsupported content stay on the phone, with a notice in the ADE rather than an incomplete form.
