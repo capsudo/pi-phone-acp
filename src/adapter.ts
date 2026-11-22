@@ -40,6 +40,7 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
   const lifetime = new AbortController()
   const app = acp.agent({ name: 'pi-phone-acp' })
   let formSupported = false
+  let noticeSupported = false
 
   const safe = async <T>(action: () => Promise<T>): Promise<T> => {
     try { return await action() } catch (error) {
@@ -68,9 +69,15 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
   const send = async (id: string, update: acp.SessionUpdate, client: acp.AgentContext) => {
     await client.notify(acp.methods.client.session.update, { sessionId: id, update })
   }
-  const notice = (id: string, text: string, client: acp.AgentContext) => send(id, {
-    sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `\n${text}\n` },
-  }, client)
+  const notice = (id: string, text: string, client: acp.AgentContext, title?: string) => {
+    const message = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+    return send(id, noticeSupported ? {
+      sessionUpdate: 'notice', severity: 'info', title: title ?? message,
+      ...(title === undefined ? {} : { description: message }),
+    } : {
+      sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `\n${text}\n` },
+    }, client)
+  }
 
   const event = async (id: string, attached: AttachedSession, item: PhoneEvent, client: acp.AgentContext, signal: AbortSignal) => {
     if (item.type === 'end') return
@@ -99,7 +106,7 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
             : !privateInput && !formSupported ? 'This client did not advertise form support.'
               : !attached.prompt?.started ? 'T3 needs an active prompt turn to show forms; reconnect replay is observation only.'
                 : 'This form is sensitive, unknown or malformed, or requires saved phone sign-in choices.'
-          await notice(id, `[Phone is waiting for an interactive approval. Complete it in pi-phone. ${reason} Nothing was approved automatically.]`, client)
+          await notice(id, `[Phone is waiting for an interactive approval. Complete it in pi-phone. ${reason} Nothing was approved automatically.]`, client, 'Complete this request in pi-phone')
           return
         }
         const dialog = new AbortController()
@@ -113,14 +120,17 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
             const result = item.privateForm
               ? await forwardPrivate(phone, id, { ...item, privateForm: item.privateForm }, client, questionSignal, secretFiles, options.secretTimeoutMs)
               : await forwardInteractive(phone, id, item, client, questionSignal)
-            if (result === 'phone' && !questionSignal.aborted) await notice(id, '[Interactive question remains on the phone. Complete it in pi-phone. No answer was sent automatically.]', client)
+            if (result === 'phone' && !questionSignal.aborted) await notice(id, '[Interactive question remains on the phone. Complete it in pi-phone. No answer was sent automatically.]', client, 'Complete this question in pi-phone')
           } catch (error) {
             // Even validation exceptions can include answer/credential contents.
             const reason = error instanceof PhoneOnlyInterview ? error.message : 'Could not forward or validate this interactive question; no automatic retry was attempted.'
             const action = error instanceof PhoneOnlyInterview && error.reason === 'private'
               ? 'Use a dedicated secret/sign-in prompt in pi-phone instead; do not enter credentials in this interview. No answer was sent automatically.'
               : 'Complete it in pi-phone. Unsupported content, saved drafts or changed questions are not replaced.'
-            if (!questionSignal.aborted) await notice(id, `[${reason} ${action}]`, client).catch(() => {})
+            const title = error instanceof PhoneOnlyInterview
+              ? error.reason === 'private' ? 'Use a dedicated private prompt in pi-phone' : 'Complete this interview in pi-phone'
+              : 'Check this question in pi-phone'
+            if (!questionSignal.aborted) await notice(id, `[${reason} ${action}]`, client, title).catch(() => {})
           } finally { attached.dialogs.delete(item.id); attached.interactiveDialogs.delete(item.id) }
         })
         return
@@ -150,10 +160,12 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
       })().catch(async () => {
         if (!approvalSignal.aborted) await notice(id, '[Could not resolve phone approval. Check it in pi-phone.]', client).catch(() => {})
       }).finally(() => attached.dialogs.delete(item.id))
+    } else if (item.type === 'notice') {
+      await notice(id, item.text, client)
     } else {
       await send(id, {
         sessionUpdate: item.type === 'user' ? 'user_message_chunk' : item.type === 'thought' ? 'agent_thought_chunk' : 'agent_message_chunk',
-        content: { type: 'text', text: item.type === 'notice' ? `\n${item.text}\n` : item.text },
+        content: { type: 'text', text: item.text },
       }, client)
     }
   }
@@ -189,6 +201,7 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
   app.onRequest(acp.methods.agent.initialize, ({ params }) => {
     if (params.protocolVersion < acp.PROTOCOL_VERSION) throw acp.RequestError.unsupportedProtocolVersion(params.protocolVersion, [acp.PROTOCOL_VERSION])
     formSupported = params.clientCapabilities?.elicitation?.form != null
+    noticeSupported = params.clientCapabilities?.session?.notices != null
     return {
       protocolVersion: acp.PROTOCOL_VERSION,
       agentInfo: { name: 'pi-phone-acp', version: '0.1.0' },

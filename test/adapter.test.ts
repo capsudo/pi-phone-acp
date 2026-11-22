@@ -88,6 +88,35 @@ async function initialize(agent: acp.ClientContext) {
   return agent.request(acp.methods.agent.initialize, { protocolVersion: acp.PROTOCOL_VERSION })
 }
 
+for (const protocolVersion of [1, 2]) for (const [label, capabilities, supported] of [
+  ['omitted capabilities', undefined, false],
+  ['null session capabilities', { session: null }, false],
+  ['omitted notices', { session: {} }, false],
+  ['null notices', { session: { notices: null } }, false],
+  ['advertised notices', { session: { notices: {} } }, true],
+] as const) test(`live notices honor ${label} when negotiating ACP ${protocolVersion}`, async () => {
+  const { phone, updates, connection, agent } = connect()
+  try {
+    await agent.request(acp.methods.agent.initialize, { protocolVersion, ...(capabilities === undefined ? {} : { clientCapabilities: capabilities }) })
+    const { sessionId } = await agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, workspace)
+    const result = agent.request(acp.methods.agent.session.prompt, promptFor(sessionId))
+    let finished = false
+    void result.then(() => { finished = true }, () => { finished = true })
+    await phone.started.promise
+    phone.emit({ type: 'notice', text: '[Complete this request in pi-phone.]' })
+    for (let i = 0; i < 30 && updates.length === 0; i++) await new Promise<void>(resolve => setImmediate(resolve))
+    assert.deepEqual(updates, [{ sessionId, update: supported
+      ? { sessionUpdate: 'notice', severity: 'info', title: 'Complete this request in pi-phone.' }
+      : { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\n[Complete this request in pi-phone.]\n' } },
+    }])
+    assert.equal(finished, false, 'The notice must arrive before phone completion')
+    assert.equal(phone.submissions.length, 1)
+    assert.equal(phone.cancellations.length, 0)
+    phone.finish()
+    assert.deepEqual(await result, { stopReason: 'end_turn' })
+  } finally { connection.close() }
+})
+
 test('negotiates ACP v1 when a client prefers v2, with honest capabilities', async () => {
   const { connection, agent } = connect()
   try {

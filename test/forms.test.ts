@@ -67,7 +67,7 @@ class FormsPhone implements PhoneBackend {
   withdraw() { this.extra.push({ type: 'approval_withdrawn', id: 'form/1' }); this.wake.resolve() }
 }
 const workspace = { cwd: '/t3/project', mcpServers: [] }
-async function harness(phone: FormsPhone, responses: (params: acp.CreateElicitationRequest, signal: AbortSignal) => unknown | Promise<unknown>, support = true) {
+async function harness(phone: FormsPhone, responses: (params: acp.CreateElicitationRequest, signal: AbortSignal) => unknown | Promise<unknown>, support = true, notices = false) {
   const requests: acp.CreateElicitationRequest[] = []
   const updates: acp.SessionNotification[] = []
   const client = acp.client()
@@ -81,7 +81,10 @@ async function harness(phone: FormsPhone, responses: (params: acp.CreateElicitat
     .onNotification(acp.methods.client.session.update, ({ params }) => { updates.push(params) })
   const connection = client.connect(createAdapter(phone))
   const agent = connection.agent
-  await agent.request(acp.methods.agent.initialize, { protocolVersion: 2, ...(support ? { clientCapabilities: { elicitation: { form: {} } } } : {}) })
+  await agent.request(acp.methods.agent.initialize, { protocolVersion: 2, clientCapabilities: {
+    ...(support ? { elicitation: { form: {} } } : {}),
+    ...(notices ? { session: { notices: {} } } : {}),
+  } })
   const { sessionId } = await agent.request<acp.NewSessionResponse>(acp.methods.agent.session.new, workspace)
   const result = agent.request(acp.methods.agent.session.prompt, { sessionId, prompt: [{ type: 'text', text: 'ask' }] })
   return { connection, agent, result, requests, updates }
@@ -155,6 +158,84 @@ test('clients without form capability get a notice, not a request or answer', as
   const phone = new FormsPhone()
   const h = await harness(phone, () => { assert.fail('Client has no form capability') }, false)
   try { await settleFallback(h, phone); assert.equal(h.requests.length, 0); assert.deepEqual(phone.answers, []) } finally { h.connection.close() }
+})
+
+test('notice-capable clients without form support get an actionable notice without an input request', async () => {
+  const phone = new FormsPhone()
+  const h = await harness(phone, () => { assert.fail('Client has no form capability') }, false, true)
+  try {
+    await settleFallback(h, phone)
+    assert.deepEqual(h.updates.map(item => item.update.sessionUpdate), ['notice'])
+    assert.equal(h.updates[0]!.update.sessionUpdate === 'notice' && h.updates[0]!.update.title, 'Complete this request in pi-phone')
+    assert.equal(h.requests.length, 0)
+    assert.deepEqual(phone.answers, [])
+    assert.equal(phone.stops, 0)
+  } finally { h.connection.close() }
+})
+
+test('notice capability leaves supported ordinary forms and their answers unchanged', async () => {
+  const phone = new FormsPhone()
+  const h = await harness(phone, queued([{ destination: 'demo' }]), true, true)
+  try {
+    await h.result
+    assert.equal(h.requests.length, 1)
+    assert.deepEqual(phone.answers, [{ kind: 'ask', id: 'form/1', values: { destination: 'demo' } }])
+    assert.equal(h.updates.length, 0)
+  } finally { h.connection.close() }
+})
+
+test('notice capability leaves supported interviews and their explicit submission unchanged', async () => {
+  const phone = new FormsPhone({ ...interviewForm, count: 1 })
+  phone.source = { questions: { questions: [{ id: 'text', type: 'text', question: 'Feedback?' }] }, draft: [], status: 'waiting', createdAt: 123 }
+  const replies = [{ route: 'answer' }, { value: 'source-ok' }, { submit: true }]
+  const h = await harness(phone, queued(replies), true, true)
+  try {
+    await h.result
+    assert.equal(replies.length, 0)
+    assert.equal(h.requests.length, 3)
+    assert.deepEqual(phone.answers, [{ kind: 'interview', id: '1', callId: 'call/1', action: 'submit', draft: [{ id: 'text', value: 'source-ok' }] }])
+    assert.equal(h.updates.length, 0)
+  } finally { h.connection.close() }
+})
+
+test('unsupported rich interview emits one standalone notice while pending and preserves phone completion', async () => {
+  const phone = new FormsPhone({ ...interviewForm, count: 1, title: 'Rich content fallback test' })
+  phone.source = { questions: { title: 'Rich content fallback test', questions: [
+    { id: 'fallback_check', type: 'text', question: 'Answer on the phone.', content: { source: '![DO_NOT_LEAK](https://example.invalid/demo.png)', lang: 'md', showSource: false } },
+  ] }, draft: [], status: 'waiting', createdAt: 123 }
+  const h = await harness(phone, () => { assert.fail('Unsupported content must not create an incomplete form or acknowledgement card') }, true, true)
+  let finished = false
+  void h.result.then(() => { finished = true }, () => { finished = true })
+  try {
+    for (let i = 0; i < 30 && h.updates.length === 0; i++) await tick()
+    assert.equal(finished, false, 'Phone input is still pending when the notice arrives')
+    assert.equal(h.updates.length, 1, 'Repeated observations must not duplicate the notice')
+    const update = h.updates[0]!.update
+    assert.equal(update.sessionUpdate, 'notice')
+    if (update.sessionUpdate !== 'notice') assert.fail('Expected a standalone ACP notice')
+    assert.equal(update.title, 'Complete this interview in pi-phone')
+    assert.equal(update.severity, 'info')
+    assert.match(update.description!, /phone-only media, Markdown rendering/)
+    assert.match(update.description!, /Complete it in pi-phone/)
+    assert.doesNotMatch(JSON.stringify(h.updates), /DO_NOT_LEAK|example.invalid/)
+    assert.equal(phone.getCount, 1)
+    assert.deepEqual(phone.answers, [])
+    assert.equal(h.requests.length, 0)
+
+    phone.extra.push(
+      { type: 'approval_withdrawn', id: 'form/1' },
+      { type: 'tool', id: 'call/1', name: 'interview', status: 'completed', output: 'fallback_check: phone-ok' },
+      { type: 'text', text: 'fallback_check: phone-ok' },
+    )
+    phone.wake.resolve()
+    for (let i = 0; i < 30 && !h.updates.some(item => item.update.sessionUpdate === 'agent_message_chunk'); i++) await tick()
+    assert.ok(h.updates.some(item => item.update.sessionUpdate === 'agent_message_chunk' && item.update.content.type === 'text' && item.update.content.text === 'fallback_check: phone-ok'))
+    phone.ended.resolve()
+    assert.equal((await h.result).stopReason, 'end_turn')
+    assert.equal(h.updates.filter(item => item.update.sessionUpdate === 'notice').length, 1)
+    assert.deepEqual(phone.answers, [], 'The adapter must not submit an answer or decline for the phone')
+    assert.equal(phone.stops, 0)
+  } finally { h.connection.close() }
 })
 
 test('mixed sensitive asks, OTP autocomplete and unknown fields stay entirely phone-only', async () => {
