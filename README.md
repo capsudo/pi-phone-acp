@@ -1,5 +1,13 @@
 # pi-phone-acp
 
+[![npm version](https://img.shields.io/npm/v/pi-phone-acp)](https://www.npmjs.com/package/pi-phone-acp)
+[![npm downloads](https://img.shields.io/npm/dm/pi-phone-acp)](https://www.npmjs.com/package/pi-phone-acp)
+[![Node.js requirement](https://img.shields.io/node/v/pi-phone-acp)](https://nodejs.org/)
+[![License](https://img.shields.io/npm/l/pi-phone-acp)](LICENSE)
+[![Nix flake](https://img.shields.io/badge/Nix-flake-5277C3?logo=nixos&logoColor=white)](#nix-linux)
+[![ACP v1](https://img.shields.io/badge/ACP-v1-blue)](https://agentclientprotocol.com/)
+[![Platforms: Linux and macOS](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-lightgrey)](#install-and-configure)
+
 ACP adapter making [pi-phone](https://github.com/picassio/pi-phone) available to [ADE](# "Agentic Development Environment")s such as T3 Code, Herdr, Orca, Zed...
 
 This allows to **control a pi agent on an android phone** directly from computer **in the ADE**, like any other agent.
