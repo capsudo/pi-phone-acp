@@ -58,11 +58,60 @@ Tested on **T3 Code 0.1.8** (and Zed 1.28.1 for ordinary input fallback).
 
 ## Install and configure
 
+### npm
+
 Node.js 22 or later on Linux or macOS is required.
 
 ```sh
 npm install --global pi-phone-acp
 ```
+
+### Nix (Linux)
+
+The flake packages the published `pi-phone-acp@3.0.0` npm archive, not the repository's TypeScript. It supplies Node.js 24 and a locked set of npm runtime dependencies. Supported flake systems are `x86_64-linux` and `aarch64-linux`. Both methods below require Nix with flakes enabled.
+
+#### Command line
+
+Run without installing, using the configuration described below:
+
+```sh
+nix run github:capsudo/pi-phone-acp -- --doctor
+```
+
+Or install into a user profile:
+
+```sh
+nix profile install github:capsudo/pi-phone-acp
+```
+
+#### Flake input (NixOS / Home Manager)
+
+Add an input to the configuration's `flake.nix`:
+
+```nix
+inputs.pi-phone-acp = {
+  url = "github:capsudo/pi-phone-acp";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+In a NixOS module with `inputs` and `pkgs` in scope:
+
+```nix
+environment.systemPackages = [
+  inputs.pi-phone-acp.packages.${pkgs.stdenv.hostPlatform.system}.default
+];
+```
+
+For Home Manager, use the same package in `home.packages`. Pass `inputs` through NixOS `specialArgs` or Home Manager `extraSpecialArgs`, or capture the flake input in the module's surrounding scope.
+
+The configuration's `flake.lock` records the adapter revision. The optional `follows` uses the configuration's nixpkgs; omit it to use this project's locked nixpkgs instead.
+
+### Configuration
+
+The same runtime settings apply to all installation methods. Installation does not start a service or provision phone access.
+
+> Keep token values and token files outside Nix expressions and flake sources: they can become readable in the Nix store. Only pass the external private file's path at runtime.
 
 | Environment variable | Value |
 | --- | --- |
