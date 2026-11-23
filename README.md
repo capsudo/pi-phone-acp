@@ -77,7 +77,7 @@ npm install --global pi-phone-acp
 
 ### Nix (Linux)
 
-The flake packages the published `pi-phone-acp@3.0.0` npm archive, not the repository's TypeScript. It supplies Node.js 24 and a locked set of npm runtime dependencies. Supported flake systems are `x86_64-linux` and `aarch64-linux`. Both methods below require Nix with flakes enabled.
+The flake packages the published `pi-phone-acp@1.3.0` npm archive, not the repository's TypeScript. It supplies Node.js 24 and a locked set of npm runtime dependencies. Supported flake systems are `x86_64-linux` and `aarch64-linux`. Both methods below require Nix with flakes enabled.
 
 #### Command line
 

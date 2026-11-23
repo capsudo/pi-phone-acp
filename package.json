@@ -1,6 +1,6 @@
 {
   "name": "pi-phone-acp",
-  "version": "3.0.0",
+  "version": "1.3.0",
   "description": "ACP adapter for a phone-owned pi-phone agent",
   "type": "module",
   "engines": {

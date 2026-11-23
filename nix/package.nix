@@ -8,15 +8,15 @@
 
 buildNpmPackage (finalAttrs: {
   pname = "pi-phone-acp";
-  version = "3.0.0";
+  version = "1.3.0";
 
   src = fetchurl {
     url = "https://registry.npmjs.org/pi-phone-acp/-/pi-phone-acp-${finalAttrs.version}.tgz";
-    hash = "sha256-v5r2okS05o5WncRaWf5Zf+KcdV7LGfbJ3LIqMGJ85iY=";
+    hash = "sha256-PcSWzh+KT3075EXh1gE7xyKho5926cxWtI2//wm+g2A=";
   };
 
   nodejs = nodejs_24;
-  npmDepsHash = "sha256-eK32FJSDPGANKU9+dDv8KpjpbGpnLQUCmLtLk4Se3fU=";
+  npmDepsHash = "sha256-KBH6iV86qedWQW+mT3Gi2+FwnlzBnT8gisxVfeKqrkA=";
 
   # npm publishes compiled dist/ files but no dependency lockfile. Remove the
   # source-only scripts and dev dependencies before applying the runtime lock.
