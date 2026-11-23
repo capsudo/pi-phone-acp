@@ -9,7 +9,7 @@
 [![ACP v1](https://img.shields.io/badge/ACP-v1-blue)](https://agentclientprotocol.com/)
 [![Platforms: Linux and macOS](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-lightgrey)](#install-and-configure)
 
-ACP adapter making [pi-phone](https://github.com/picassio/pi-phone) available to [ADE](# "Agentic Development Environment")s such as T3 Code, Herdr, Orca, Zed...
+ACP adapter making [pi-phone](https://github.com/picassio/pi-phone) available to [ADE](# "Agentic Development Environment")s such as T3 Code, bb, Orca, Zed...
 
 This allows to **control a pi agent on an android phone** directly from computer **in the ADE**, like any other agent.
 
