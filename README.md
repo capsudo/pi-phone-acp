@@ -56,13 +56,12 @@ _[2] T3 Code only._
 Targets the pi-phone **build-508** interface (`c59e0ceb993dc0ded331eeb6758f86bbaed75cec`), ACP v1.<br/>
 Tested on **T3 Code 0.1.8** (and Zed 1.28.1 for ordinary input fallback).
 
-## Build and configure
+## Install and configure
 
-Node.js 22 or later on Linux or macOS is required. Build on the machine that will run the adapter.
+Node.js 22 or later on Linux or macOS is required.
 
 ```sh
-npm ci --ignore-scripts
-npm run build
+npm install --global pi-phone-acp
 ```
 
 | Environment variable | Value |
@@ -75,13 +74,13 @@ npm run build
 Use a separately provisioned pi-phone device-session token from the existing sign-in flow. The adapter sends it as a Bearer token with `X-Pocket: 1`. It does not perform sign-in, store cookies, alter networking or manage provider credentials. Keep the token out of command arguments, Git, notes and `codesync/`. Only send plain HTTP through an already authorized, encrypted Tailscale connection.
 
 ```sh
-node dist/cli.js --doctor
-node dist/cli.js
+pi-phone-acp --doctor
+pi-phone-acp
 ```
 
 `--doctor` performs an authenticated read of `/api/me`. A successful response establishes reachability and a compatible response shape, **not** the installed APK hash or running runtime version. Normal execution reserves stdout for newline-delimited ACP JSON. Diagnostics go to stderr without raw request or response details.
 
-After separately approving provider setup, T3 can use a **Local ACP command** with the absolute Node executable and the absolute `dist/cli.js` path as its argument. Set the environment variables on that same T3 server. Building the adapter does not install or register a provider.
+> After installation, add `pi-phone-acp` to the ADE as an ACP agent.
 
 ## Behavior
 
@@ -109,7 +108,10 @@ After separately approving provider setup, T3 can use a **Local ACP command** wi
 
 ## Development checks
 
+Build from source and run the checks:
+
 ```sh
+npm ci --ignore-scripts
 npm run check
 npm test
 npm audit --omit=dev

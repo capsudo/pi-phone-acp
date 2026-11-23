@@ -1,7 +1,6 @@
 {
   "name": "pi-phone-acp",
-  "version": "0.1.0",
-  "private": true,
+  "version": "3.0.0",
   "description": "ACP adapter for a phone-owned pi-phone agent",
   "type": "module",
   "engines": {
@@ -11,7 +10,8 @@
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc --noEmit",
     "test": "npm run build && tsx --test test/*.test.ts",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "2.7.0",
@@ -25,5 +25,21 @@
   },
   "bin": {
     "pi-phone-acp": "dist/cli.js"
-  }
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/capsudo/pi-phone-acp.git"
+  },
+  "homepage": "https://github.com/capsudo/pi-phone-acp#readme",
+  "bugs": {
+    "url": "https://github.com/capsudo/pi-phone-acp/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "license": "MIT"
 }
