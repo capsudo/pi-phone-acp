@@ -11,7 +11,8 @@
     "check": "tsc --noEmit",
     "test": "npm run build && tsx --test test/*.test.ts",
     "start": "node dist/cli.js",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "test:coverage": "npm run build && c8 tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "2.7.0",
@@ -20,6 +21,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "c8": "^11.0.0",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0"
   },
@@ -41,5 +43,11 @@
     "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "overrides": {
+    "test-exclude": {
+      "glob": "^14.0.2",
+      "minimatch": "^11.0.1"
+    }
+  }
 }

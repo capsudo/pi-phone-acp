@@ -1,0 +1,10 @@
+{
+  "all": true,
+  "src": ["src"],
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.d.ts", "src/phone.ts"],
+  "extension": [".ts"],
+  "exclude-after-remap": true,
+  "reporter": ["text", "html", "lcov", "json-summary"],
+  "reports-dir": "coverage"
+}

@@ -2,6 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/pi-phone-acp)](https://www.npmjs.com/package/pi-phone-acp)
 [![npm downloads](https://img.shields.io/npm/dm/pi-phone-acp)](https://www.npmjs.com/package/pi-phone-acp)
+[![Line coverage](https://img.shields.io/badge/coverage-98.22%25-brightgreen)](#development-checks)
 [![Node.js requirement](https://img.shields.io/node/v/pi-phone-acp)](https://nodejs.org/)
 [![License](https://img.shields.io/npm/l/pi-phone-acp)](LICENSE)
 [![Nix flake](https://img.shields.io/badge/Nix-flake-5277C3?logo=nixos&logoColor=white)](#nix-linux)
@@ -171,5 +172,8 @@ Build from source and run the checks:
 npm ci --ignore-scripts
 npm run check
 npm test
+npm run test:coverage
 npm audit --omit=dev
 ```
+
+`npm run test:coverage` runs the same tests with coverage for `src/`, including CLI subprocesses and unexecuted files. Type declarations, including the type-only `src/phone.ts`, are excluded. It prints a summary and writes an HTML report to `coverage/index.html`, LCOV to `coverage/lcov.info`, and a JSON summary to `coverage/coverage-summary.json`. Reports are ignored by Git. No minimum coverage threshold is enforced. The badge shows a manually updated local line-coverage snapshot, not an automated CI result.
