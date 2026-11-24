@@ -2,7 +2,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
 import { createdSchema, helloSchema, historySchema, pollSchema, submittedSchema, viewSchema } from './contract.js'
 import type { Entry, View } from './contract.js'
-import { PhoneHttp, PhoneHttpError } from './http.js'
+import { PhoneContractError, PhoneHttp, PhoneHttpError } from './http.js'
 import type { PhoneBackend, PhoneEvent, PhoneSession, PrivateApproval, SecretAskApproval, InterviewApproval, InterviewAnswer } from './phone.js'
 import { privateValues, supportedPrivateForm } from './private-forms.js'
 import { Projection } from './projection.js'
@@ -321,7 +321,7 @@ export class HttpPhoneBackend implements PhoneBackend {
           failures = 0
         } catch (error) {
           signal.throwIfAborted()
-          if (error instanceof z.ZodError || (error instanceof PhoneHttpError && error.status < 500) || ++failures > 5) throw error
+          if (error instanceof PhoneContractError || error instanceof z.ZodError || (error instanceof PhoneHttpError && error.status < 500) || ++failures > 5) throw error
           await delay(Math.min(this.retryDelayMs * 2 ** (failures - 1), 5000), undefined, { signal })
           continue
         }

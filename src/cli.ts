@@ -2,6 +2,7 @@
 import { Readable, Writable } from 'node:stream'
 import { ndJsonStream } from '@agentclientprotocol/sdk/unstable'
 import { createAdapter } from './adapter.js'
+import { PhoneUnavailable } from './availability.js'
 import { HttpPhoneBackend } from './backend.js'
 import { readConfig, readToken } from './config.js'
 import { PhoneHttp, PhoneHttpError } from './http.js'
@@ -28,16 +29,23 @@ async function main() {
   const stop = () => connection.close()
   process.once('SIGINT', stop)
   process.once('SIGTERM', stop)
-  try { await connection.closed } finally {
+  try {
+    await connection.closed
+    if (connection.signal.reason instanceof PhoneUnavailable) throw connection.signal.reason
+  } finally {
     process.off('SIGINT', stop)
     process.off('SIGTERM', stop)
     process.stdin.destroy()
+    // A closed ACP connection is terminal for this stdio process. Do not leave
+    // stdout open or attempt to reattach it when the phone returns.
+    process.stdout.end()
   }
 }
 
 main().catch(error => {
   // Never print raw errors, command input, URLs, response bodies or credentials.
-  const message = error instanceof PhoneHttpError && [401, 403].includes(error.status)
+  const message = error instanceof PhoneUnavailable ? error.message
+    : error instanceof PhoneHttpError && [401, 403].includes(error.status)
     ? 'Phone authentication or authorization failed. Check the private device-session token and phone access.'
     : 'pi-phone-acp could not start or verify the phone. Check configuration, private credential-file permissions, service reachability and the build-508 interface.'
   process.stderr.write(`${message}\n`)

@@ -28,6 +28,8 @@ export type InterviewApproval = Extract<PhoneEvent, { type: 'approval' }> & { fo
 export type InterviewAnswer = { action: 'submit' | 'cancel', draft?: ResponseItem[] }
 
 export interface PhoneBackend {
+  /** Authenticated, read-only API reachability and response-shape check. */
+  doctor(signal: AbortSignal): Promise<{ role: string, compatibleShape: boolean, runtimeVersionVerified: boolean }>
   create(signal: AbortSignal): Promise<PhoneSession>
   load(id: string, signal: AbortSignal): Promise<PhoneSession>
   /** Aborting signal detaches the observer, never the phone task. */

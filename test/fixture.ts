@@ -36,6 +36,14 @@ export class PhoneFixture {
   failNextPoll = false
   loseSubmitResponse = false
   rejectPollStatus = 0
+  meRequests = 0
+  meActive = 0
+  meStatus = 200
+  meHang = false
+  meHangBody = false
+  meDrop = false
+  meBody: unknown = undefined
+  meText: string | undefined
   private nextEntry = 1
   private nextPoller = 1
   readonly server = createServer(async (request, response) => {
@@ -49,7 +57,24 @@ export class PhoneFixture {
         for await (const chunk of request) chunks.push(chunk)
         body = JSON.parse(Buffer.concat(chunks).toString() || '{}') as Record<string, unknown>
       }
-      if (url.pathname === '/api/me') return this.json(response, { user: { id: 'owner', role: 'owner' }, server: { home: '/phone/home', defaultCwd: '/phone/home/work' } })
+      if (url.pathname === '/api/me') {
+        this.meRequests++
+        this.meActive++
+        response.once('close', () => { this.meActive-- })
+        if (this.meHang) return
+        if (this.meHangBody) {
+          response.writeHead(200, { 'content-type': 'application/json' })
+          response.write('{"user":')
+          return
+        }
+        if (this.meDrop) { response.destroy(); return }
+        if (this.meText !== undefined) {
+          response.writeHead(this.meStatus, { 'content-type': 'text/html' })
+          response.end(this.meText)
+          return
+        }
+        return this.json(response, this.meBody ?? { user: { id: 'owner', role: 'owner' }, server: { home: '/phone/home', defaultCwd: '/phone/home/work' } }, this.meStatus)
+      }
       if (url.pathname === '/api/sessions' && request.method === 'POST') {
         const native = this.create(String(body.cwd))
         return this.json(response, { id: native.id })

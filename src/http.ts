@@ -4,6 +4,10 @@ export class PhoneHttpError extends Error {
   constructor(readonly status: number) { super(`Phone HTTP request failed (${status})`) }
 }
 
+export class PhoneContractError extends Error {
+  constructor() { super('Phone returned an incompatible response') }
+}
+
 export class PhoneHttp {
   constructor(
     private readonly origin: URL,
@@ -35,10 +39,10 @@ export class PhoneHttp {
     }
     if (!response.headers.get('content-type')?.includes('application/json')) {
       await response.body?.cancel()
-      throw new Error('Phone returned an incompatible response')
+      throw new PhoneContractError()
     }
     const reader = response.body?.getReader()
-    if (!reader) throw new Error('Phone returned no JSON body')
+    if (!reader) throw new PhoneContractError()
     let bytes = 0
     const chunks: Uint8Array[] = []
     try {
@@ -46,10 +50,11 @@ export class PhoneHttp {
         const { done, value } = await reader.read()
         if (done) break
         bytes += value.byteLength
-        if (bytes > 32 * 1024 * 1024) throw new Error('Phone response exceeds 32 MiB')
+        if (bytes > 32 * 1024 * 1024) throw new PhoneContractError()
         chunks.push(value)
       }
     } finally { await reader.cancel().catch(() => {}) }
-    return schema.parse(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+    try { return schema.parse(JSON.parse(Buffer.concat(chunks).toString('utf8'))) }
+    catch { throw new PhoneContractError() }
   }
 }

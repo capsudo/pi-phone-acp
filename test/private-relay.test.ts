@@ -23,6 +23,8 @@ async function until(predicate: () => boolean) {
   assert.fail('Fixture did not settle')
 }
 class PrivatePhone implements PhoneBackend {
+  async doctor() { return { role: 'owner', compatibleShape: true, runtimeVersionVerified: false } }
+
   readonly ended = Promise.withResolvers<void>()
   readonly wake = Promise.withResolvers<void>()
   readonly posted = Promise.withResolvers<void>()
@@ -737,7 +739,7 @@ for (const uncertain of [false, true]) test(`secret extension real ACP + HTTP ${
       fixture.finish(1, 'Complete after phone inspection.')
     }
     await h.result
-    assert.equal(ownerChecks, 2)
+    assert.equal(ownerChecks, 3, 'One startup check plus two input-owner checks')
     assert.deepEqual(answers, [{ path: '/api/asks/extension%2Frequest%2F1', body: { values: { account: 'CANARY_http_extension', accessKey: '001234' } } }])
     assert.deepEqual(fixture.privateAnswers, [])
     assert.deepEqual(fixture.answers, [])
@@ -965,7 +967,7 @@ for (const example of ordinaryCases) for (const uncertain of [false, true]) test
     const body = 'value' in example.values ? { value: example.values.value }
       : example.form.type === 'ask' ? { values: example.values } : { values: example.values, remember: false, useSaved: false }
     assert.deepEqual(writes, [{ path: example.path + encodeURIComponent(native.id), body }])
-    assert.equal(ownerChecks, 3)
+    assert.equal(ownerChecks, 4, 'One startup check plus three input-owner checks')
     assert.deepEqual(fixture.answers, [])
     assert.deepEqual(fixture.privateAnswers, [])
     assert.equal(fixture.aborts, 0)

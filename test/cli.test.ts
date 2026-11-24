@@ -196,3 +196,87 @@ for (const completion of ['submit', 'phone', 'decline']) test(`compiled stdio or
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+for (const [label, fault, message] of [
+  ['authentication', (fixture: PhoneFixture) => { fixture.meStatus = 401 }, /authentication or authorization failed/],
+  ['contract', (fixture: PhoneFixture) => { fixture.meBody = { secret: 'DO_NOT_LEAK' } }, /API is incompatible/],
+  ['network', (fixture: PhoneFixture) => { fixture.meDrop = true }, /API is unreachable or timed out/],
+] as const) test(`compiled stdio startup ${label} failure exits nonzero and never reports initialized`, { timeout: 5000 }, async () => {
+  const fixture = await new PhoneFixture().start()
+  const directory = await mkdtemp(join(tmpdir(), 'pi-phone-unavailable-'))
+  const tokenFile = join(directory, 'token')
+  await writeFile(tokenFile, fixture.token, { mode: 0o600 })
+  fault(fixture)
+  const child = launch({ ...process.env, PI_PHONE_URL: fixture.url.origin, PI_PHONE_TOKEN_FILE: tokenFile })
+  try {
+    await assert.rejects(child.agent.request(acp.methods.agent.initialize, { protocolVersion: 1 }))
+    assert.equal(await child.exited, 1)
+    assert.match(child.errors(), message)
+    assert.doesNotMatch(child.output(), /agentInfo|agentCapabilities/)
+    assert.doesNotMatch(child.output() + child.errors(), /DO_NOT_LEAK|test-only-device-session|127\.0\.0\.1/)
+    assert.equal(fixture.meRequests, 1)
+    assert.equal(fixture.conversations.size, 0)
+    assert.equal(fixture.submissions.length, 0)
+    assert.equal(fixture.aborts, 0)
+  } finally {
+    child.connection.close()
+    if (child.child.exitCode === null) child.child.kill('SIGKILL')
+    await fixture.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('compiled stdio later idle phone loss closes stdout and exits without waiting for client EOF', { timeout: 25000 }, async () => {
+  const fixture = await new PhoneFixture().start()
+  const directory = await mkdtemp(join(tmpdir(), 'pi-phone-idle-loss-'))
+  const tokenFile = join(directory, 'token')
+  await writeFile(tokenFile, fixture.token, { mode: 0o600 })
+  const child = launch({ ...process.env, PI_PHONE_URL: fixture.url.origin, PI_PHONE_TOKEN_FILE: tokenFile })
+  try {
+    await child.agent.request(acp.methods.agent.initialize, { protocolVersion: 1 })
+    fixture.meStatus = 403
+    // Keep stdin open: the adapter, not the client, must terminate transport.
+    await child.connection.closed
+    assert.equal(await child.exited, 1)
+    assert.match(child.errors(), /authentication or authorization failed/)
+    assert.doesNotMatch(child.output() + child.errors(), /test-only-device-session|127\.0\.0\.1|Unhandled|ERR_STREAM/)
+    assert.equal(fixture.meRequests, 2)
+    assert.equal(fixture.conversations.size, 0)
+    assert.equal(fixture.submissions.length, 0)
+    assert.equal(fixture.aborts, 0)
+  } finally {
+    child.connection.close()
+    if (child.child.exitCode === null) child.child.kill('SIGKILL')
+    await fixture.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+for (const termination of ['SIGTERM', 'EOF'] as const) test(`compiled stdio ${termination} during startup check exits cleanly without reporting phone loss`, { timeout: 5000 }, async () => {
+  const fixture = await new PhoneFixture().start()
+  const directory = await mkdtemp(join(tmpdir(), 'pi-phone-startup-stop-'))
+  const tokenFile = join(directory, 'token')
+  await writeFile(tokenFile, fixture.token, { mode: 0o600 })
+  fixture.meHang = true
+  const child = launch({ ...process.env, PI_PHONE_URL: fixture.url.origin, PI_PHONE_TOKEN_FILE: tokenFile })
+  try {
+    const deadline = Date.now() + 3000
+    while (fixture.meActive === 0) {
+      assert.ok(Date.now() < deadline, 'Startup check did not begin')
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    if (termination === 'EOF') child.child.stdin.end()
+    else child.child.kill(termination)
+    assert.equal(await child.exited, 0)
+    assert.equal(child.errors(), '')
+    assert.equal(fixture.meRequests, 1)
+    assert.equal(fixture.meActive, 0)
+    assert.equal(fixture.submissions.length, 0)
+    assert.equal(fixture.aborts, 0)
+  } finally {
+    child.connection.close()
+    if (child.child.exitCode === null) child.child.kill('SIGKILL')
+    await fixture.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})

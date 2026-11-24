@@ -142,6 +142,8 @@ pi-phone-acp
 
 ## Behavior
 
+- pi-phone reachability is verified at startup by checking authenticated API access with `/api/me` call (10-second timeout). Failure closes the ACP connection and exits. In T3 Code this result in a warning banner being displayed. 
+- While connected (including when idle), pi-phone-acp checks pi-phone reachability every 15 seconds. ACP connection is closed immediately upon Authentication or incompatible API responses, while an extra check is made after 5s on network, timeout, rate-limit and server failures.
 - Reconnecting restores the phone conversation and observes existing work without restarting it or sending another prompt.
 - Submissions are never retried automatically, so inspect the phone conversation and reload it before retrying an uncertain result.
 - Secret-store prompts values are saved in pi-phone Settings > Secrets. This is not the case for browser sign-in prompts which only fill corresponding fields. 

@@ -8,6 +8,8 @@ import { Projection } from '../src/projection.js'
 import { approvalView, riskyApproval, riskyForm } from './approval-fixture.js'
 
 class FakePhone implements PhoneBackend {
+  async doctor() { return { role: 'owner', compatibleShape: true, runtimeVersionVerified: false } }
+
   readonly stored = new Map<string, PhoneSession>()
   readonly submissions: { id: string, text: string, requestId: string }[] = []
   readonly cancellations: { id: string, requestId: string }[] = []

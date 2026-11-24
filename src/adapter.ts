@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
+import { PhoneUnavailable, verifyPhone, watchPhone, type AvailabilityOptions } from './availability.js'
 import * as acp from '@agentclientprotocol/sdk/unstable'
 import type { PhoneBackend, PhoneEvent, PhoneSession } from './phone.js'
 import { forwardOrdinarySensitive } from './ordinary-input.js'
@@ -33,7 +34,11 @@ interface AttachedSession {
 }
 
 /** One ACP connection. All durable session state belongs to the phone. */
-export function createAdapter(phone: PhoneBackend, options: { secretFiles?: SecretFiles, secretTimeoutMs?: number } = {}): acp.AgentApp {
+export function createAdapter(phone: PhoneBackend, options: {
+  secretFiles?: SecretFiles
+  secretTimeoutMs?: number
+  availability?: AvailabilityOptions
+} = {}): acp.AgentApp {
   const secretFiles = options.secretFiles ?? defaultSecretFiles()
   const privateServer = (server: acp.McpServer) => 'type' in server && server.type === 'acp' && server.name === 't3-code' && server.serverId === 't3-code'
   const sessions = new Map<string, AttachedSession>()
@@ -42,9 +47,10 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
   const app = acp.agent({ name: 'pi-phone-acp' })
   let formSupported = false
   let noticeSupported = false
+  let ready: Promise<void>
 
   const safe = async <T>(action: () => Promise<T>): Promise<T> => {
-    try { return await action() } catch (error) {
+    try { await ready; lifetime.signal.throwIfAborted(); return await action() } catch (error) {
       if (error instanceof LocalError) throw error
       // Backend exceptions, even RequestError instances, may contain secrets.
       throw new acp.RequestError(-32000, failureMessage)
@@ -203,9 +209,20 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
 
   app.onConnect(connection => {
     connection.signal.addEventListener('abort', () => lifetime.abort(), { once: true })
+    // Initialization and all operations wait for this one startup read. The
+    // monitor is connection-scoped, not tied to a conversation or prompt.
+    ready = verifyPhone(phone, lifetime.signal, options.availability?.timeoutMs)
+    void ready.then(() => watchPhone(phone, lifetime.signal, options.availability)).catch(error => {
+      if (lifetime.signal.aborted) return
+      const failure = error instanceof PhoneUnavailable ? error : new PhoneUnavailable('unreachable')
+      connection.close(failure)
+    })
   })
-  app.onRequest(acp.methods.agent.initialize, ({ params }) => {
+  app.onRequest(acp.methods.agent.initialize, async ({ params }) => {
     if (params.protocolVersion < acp.PROTOCOL_VERSION) throw acp.RequestError.unsupportedProtocolVersion(params.protocolVersion, [acp.PROTOCOL_VERSION])
+    try { await ready; lifetime.signal.throwIfAborted() } catch {
+      throw new acp.RequestError(-32000, 'Phone API could not be verified. Check adapter diagnostics and phone access.')
+    }
     formSupported = params.clientCapabilities?.elicitation?.form != null
     noticeSupported = params.clientCapabilities?.session?.notices != null
     return {
@@ -282,6 +299,7 @@ export function createAdapter(phone: PhoneBackend, options: { secretFiles?: Secr
     }
   }))
   app.onNotification(acp.methods.agent.session.cancel, ({ params }) => {
+    if (lifetime.signal.aborted) return
     const attached = sessions.get(params.sessionId)
     const active = attached?.prompt
     if (!attached || !active || active.cancelRequested) return

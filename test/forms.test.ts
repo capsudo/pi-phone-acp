@@ -31,6 +31,8 @@ const view = (form: unknown) => viewSchema.parse({ full: true, conversation: { i
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 
 class FormsPhone implements PhoneBackend {
+  async doctor() { return { role: 'owner', compatibleShape: true, runtimeVersionVerified: false } }
+
   readonly answers: unknown[] = []
   readonly ended = Promise.withResolvers<void>()
   readonly started = Promise.withResolvers<void>()
@@ -932,7 +934,7 @@ for (const uncertain of [false, true]) test(`credential interview real ACP + HTT
       fixture.finish(1, 'Completed after phone inspection.')
     }
     await h.result
-    assert.equal(ownerChecks, 2)
+    assert.equal(ownerChecks, 3, 'One startup check plus two input-owner checks')
     assert.equal(interviewReads, 3)
     assert.deepEqual(writes, [{ path: '/api/c/1/interviews/call%2F1', body: { action: 'submit', draft: [{ id: 'name', value: 'CANARY_http_interview' }, { id: 'credential', value: '001234' }] } }])
     assert.deepEqual(fixture.answers, [])
@@ -1233,7 +1235,7 @@ for (const completion of ['submit', 'decline', 'uncertain']) test(`ordinary cred
     assert.deepEqual(writes, [{ path: '/api/c/1/interviews/call%2F1', body: completion === 'decline' ? { action: 'cancel' } : {
       action: 'submit', draft: [{ id: 'name', value: 'CANARY_http_ordinary' }, { id: 'credential', value: '001234' }],
     } }])
-    assert.equal(ownerChecks, 3)
+    assert.equal(ownerChecks, 4, 'One startup check plus three input-owner checks')
     assert.equal(reads, 4)
     assert.deepEqual(h.privateRequests, [])
     assert.deepEqual(fixture.answers, [])
