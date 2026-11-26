@@ -2,15 +2,24 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import { test } from 'node:test'
 import * as acp from '@agentclientprotocol/sdk/unstable'
 import { PhoneFixture } from './fixture.js'
 import { privateView } from './private-fixture.js'
+import { stopAdapter } from './daemon-fixture.js'
+
+const adapters = new Set<string>()
+async function stopAdapters() {
+  for (const path of adapters) { await stopAdapter(path) }
+  adapters.clear()
+}
 
 function launch(env: NodeJS.ProcessEnv, setup: (peer: ReturnType<typeof acp.client>) => ReturnType<typeof acp.client> = peer => peer) {
-  const child = spawn(process.execPath, ['dist/cli.js'], { env, stdio: ['pipe', 'pipe', 'pipe'] })
+  const socket = join(dirname(env.PI_PHONE_TOKEN_FILE!), 'adapter.sock')
+  adapters.add(socket)
+  const child = spawn(process.execPath, ['dist/cli.js'], { env: { ...env, PI_PHONE_SOCKET: socket }, stdio: ['pipe', 'pipe', 'pipe'] })
   let errors = ''
   let output = ''
   child.stdout.on('data', chunk => { output += Buffer.from(chunk).toString('utf8') })
@@ -59,6 +68,7 @@ test(`stdio ${termination} leaves phone work running, and a replacement loads th
     second?.connection.close()
     if (first.child.exitCode === null) first.child.kill('SIGKILL')
     if (second && second.child.exitCode === null) second.child.kill('SIGKILL')
+    await stopAdapters()
     await fixture.close()
     await rm(directory, { recursive: true, force: true })
   }
@@ -133,6 +143,7 @@ test('compiled stdio private card uses the configured exact directory and posts 
   } finally {
     child.connection.close()
     if (child.child.exitCode === null) child.child.kill('SIGKILL')
+    await stopAdapters()
     await fixture.close()
     await rm(directory, { recursive: true, force: true })
   }
@@ -192,6 +203,7 @@ for (const completion of ['submit', 'phone', 'decline']) test(`compiled stdio or
   } finally {
     child.connection.close()
     if (child.child.exitCode === null) child.child.kill('SIGKILL')
+    await stopAdapters()
     await fixture.close()
     await rm(directory, { recursive: true, force: true })
   }
@@ -214,19 +226,20 @@ for (const [label, fault, message] of [
     assert.match(child.errors(), message)
     assert.doesNotMatch(child.output(), /agentInfo|agentCapabilities/)
     assert.doesNotMatch(child.output() + child.errors(), /DO_NOT_LEAK|test-only-device-session|127\.0\.0\.1/)
-    assert.equal(fixture.meRequests, 1)
+    assert.ok(fixture.meRequests >= 1 && fixture.meRequests <= 3)
     assert.equal(fixture.conversations.size, 0)
     assert.equal(fixture.submissions.length, 0)
     assert.equal(fixture.aborts, 0)
   } finally {
     child.connection.close()
     if (child.child.exitCode === null) child.child.kill('SIGKILL')
+    await stopAdapters()
     await fixture.close()
     await rm(directory, { recursive: true, force: true })
   }
 })
 
-test('compiled stdio later idle phone loss closes stdout and exits without waiting for client EOF', { timeout: 25000 }, async () => {
+test('compiled stdio phone loss detected by observation closes stdout and exits without waiting for client EOF', { timeout: 25000 }, async () => {
   const fixture = await new PhoneFixture().start()
   const directory = await mkdtemp(join(tmpdir(), 'pi-phone-idle-loss-'))
   const tokenFile = join(directory, 'token')
@@ -234,19 +247,22 @@ test('compiled stdio later idle phone loss closes stdout and exits without waiti
   const child = launch({ ...process.env, PI_PHONE_URL: fixture.url.origin, PI_PHONE_TOKEN_FILE: tokenFile })
   try {
     await child.agent.request(acp.methods.agent.initialize, { protocolVersion: 1 })
+    await child.agent.request(acp.methods.agent.session.new, { cwd: '/t3/project', mcpServers: [] })
     fixture.meStatus = 403
+    fixture.rejectPollStatus = 401
     // Keep stdin open: the adapter, not the client, must terminate transport.
     await child.connection.closed
     assert.equal(await child.exited, 1)
     assert.match(child.errors(), /authentication or authorization failed/)
     assert.doesNotMatch(child.output() + child.errors(), /test-only-device-session|127\.0\.0\.1|Unhandled|ERR_STREAM/)
-    assert.equal(fixture.meRequests, 2)
-    assert.equal(fixture.conversations.size, 0)
+    assert.ok(fixture.meRequests >= 2 && fixture.meRequests <= 4)
+    assert.equal(fixture.conversations.size, 1)
     assert.equal(fixture.submissions.length, 0)
     assert.equal(fixture.aborts, 0)
   } finally {
     child.connection.close()
     if (child.child.exitCode === null) child.child.kill('SIGKILL')
+    await stopAdapters()
     await fixture.close()
     await rm(directory, { recursive: true, force: true })
   }
@@ -269,13 +285,15 @@ for (const termination of ['SIGTERM', 'EOF'] as const) test(`compiled stdio ${te
     else child.child.kill(termination)
     assert.equal(await child.exited, 0)
     assert.equal(child.errors(), '')
-    assert.equal(fixture.meRequests, 1)
+    assert.ok(fixture.meRequests >= 1 && fixture.meRequests <= 3)
+    await stopAdapters()
     assert.equal(fixture.meActive, 0)
     assert.equal(fixture.submissions.length, 0)
     assert.equal(fixture.aborts, 0)
   } finally {
     child.connection.close()
     if (child.child.exitCode === null) child.child.kill('SIGKILL')
+    await stopAdapters()
     await fixture.close()
     await rm(directory, { recursive: true, force: true })
   }

@@ -39,7 +39,7 @@ export async function verifyPhone(phone: PhoneBackend, signal: AbortSignal, time
 export async function watchPhone(phone: PhoneBackend, signal: AbortSignal, options: AvailabilityOptions = {}): Promise<void> {
   let failures = 0
   for (;;) {
-    await delay(failures ? options.retryDelayMs ?? 5000 : options.intervalMs ?? 15_000, undefined, { signal })
+    await delay(failures ? options.retryDelayMs ?? 5000 : options.intervalMs ?? 300_000, undefined, { signal })
     try {
       await verifyPhone(phone, signal, options.timeoutMs)
       failures = 0

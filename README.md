@@ -128,6 +128,7 @@ The same runtime settings apply to all installation methods. Installation does n
 | `PI_PHONE_TOKEN_FILE` | Absolute path to an owned, private regular file outside the repository containing only the device-session token. Owner-only permissions such as `0600` are required. Symlinks are refused. |
 | `PI_PHONE_CWD` | Existing local folder inside pi-phone, default `~/work`. This is not T3's project directory. |
 | `PI_PHONE_SECRET_FILES_DIR` | Optional exact canonical T3 secret-delivery directory, default `~/.t3/userdata/secrets/files`. Set explicitly for custom T3 server layouts. Private forwarding currently requires Linux. |
+| `PI_PHONE_SOCKET` | Optional private local socket path. Normally selected automatically. |
 
 Use a separately provisioned pi-phone device-session token from the existing sign-in flow. The adapter sends it as a Bearer token with `X-Pocket: 1`. It does not perform sign-in, store cookies, alter networking or manage provider credentials. Keep the token out of command arguments, Git, notes and `codesync/`. Only send plain HTTP through an already authorized, encrypted Tailscale connection.
 
@@ -142,12 +143,13 @@ pi-phone-acp
 
 ## Behavior
 
-- pi-phone reachability is verified at startup by checking authenticated API access with `/api/me` call (10-second timeout). Failure closes the ACP connection and exits. In T3 Code this result in a warning banner being displayed. 
-- While connected (including when idle), pi-phone-acp checks pi-phone reachability every 15 seconds. ACP connection is closed immediately upon Authentication or incompatible API responses, while an extra check is made after 5s on network, timeout, rate-limit and server failures.
-- Reconnecting restores the phone conversation and observes existing work without restarting it or sending another prompt.
-- Submissions are never retried automatically, so inspect the phone conversation and reload it before retrying an uncertain result.
+- pi-phone reachability / ACP connection
+    - on startup: pi-phone reachability is verified before each ACP connection with an authenticated `/api/me` call (10-second timeout). If pi-phone is unreachable or access is rejected, the connection is refused. In T3 Code, a warning banner is displayed when this happens during a provider check.
+    - regular  checks: While idle, pi-phone-acp checks pi-phone reachability every 5 minutes. An earlier check may be made after an unsuccessful request to pi-phone.
+    - ACP connection state and pi-phone-acp process:ACP connection is closed if pi-phone rejects access or returns an incompatible API response, or if it becomes unreachable. **pi-phone-acp stays running** to check for recovery.
+- persistent relay adapter: ADEs start a new process for each ACP connection, leaving previous processes running. For pi-phone-acp, old process would still periodically check pi-phone reachability. Therefore, a relay mechanism is used so every pi-phone-acp process actually act a relay to the same persistent adapter, which stays running and check pi-phone reachability. 
+- Reconnecting restores the pi-phone conversation and observes existing work without restarting it or sending another prompt.
 - Secret-store prompts values are saved in pi-phone Settings > Secrets. This is not the case for browser sign-in prompts which only fill corresponding fields. 
-- Declining a private prompt rejects only its matching phone request, while cancellation, timeout and disconnect leave it unanswered.
 - Interview answers are saved in pi-phone and returned to the LLM.
 
 ## Limits

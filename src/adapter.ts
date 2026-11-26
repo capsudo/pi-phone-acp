@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import { PhoneUnavailable, verifyPhone, watchPhone, type AvailabilityOptions } from './availability.js'
+import type { PhoneMonitor } from './phone-monitor.js'
 import * as acp from '@agentclientprotocol/sdk/unstable'
 import type { PhoneBackend, PhoneEvent, PhoneSession } from './phone.js'
 import { forwardOrdinarySensitive } from './ordinary-input.js'
@@ -38,6 +39,7 @@ export function createAdapter(phone: PhoneBackend, options: {
   secretFiles?: SecretFiles
   secretTimeoutMs?: number
   availability?: AvailabilityOptions
+  phoneMonitor?: PhoneMonitor
 } = {}): acp.AgentApp {
   const secretFiles = options.secretFiles ?? defaultSecretFiles()
   const privateServer = (server: acp.McpServer) => 'type' in server && server.type === 'acp' && server.name === 't3-code' && server.serverId === 't3-code'
@@ -209,6 +211,11 @@ export function createAdapter(phone: PhoneBackend, options: {
 
   app.onConnect(connection => {
     connection.signal.addEventListener('abort', () => lifetime.abort(), { once: true })
+    if (options.phoneMonitor) {
+      ready = options.phoneMonitor.attach(connection)
+      void ready.catch(() => {})
+      return
+    }
     // Initialization and all operations wait for this one startup read. The
     // monitor is connection-scoped, not tied to a conversation or prompt.
     ready = verifyPhone(phone, lifetime.signal, options.availability?.timeoutMs)

@@ -23,6 +23,7 @@ interface Poller {
 /** Source-shaped build-508 fixture, not a claim of testing the actual APK. */
 export class PhoneFixture {
   readonly token = 'test-only-device-session'
+  acceptedToken = this.token
   readonly conversations = new Map<number, Conversation>()
   readonly submitted = Promise.withResolvers<{ id: number, text: string, requestId: string }>()
   readonly submissions: { id: number, text: string, requestId: string }[] = []
@@ -48,7 +49,7 @@ export class PhoneFixture {
   private nextPoller = 1
   readonly server = createServer(async (request, response) => {
     try {
-      if (request.headers.authorization !== `Bearer ${this.token}`) return this.json(response, { error: 'Sign in first' }, 401)
+      if (request.headers.authorization !== `Bearer ${this.acceptedToken}`) return this.json(response, { error: 'Sign in first' }, 401)
       if (request.method !== 'GET' && request.headers['x-pocket'] !== '1') return this.json(response, {}, 403)
       const url = new URL(request.url!, 'http://localhost')
       let body: Record<string, unknown> = {}

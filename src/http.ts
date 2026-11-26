@@ -11,20 +11,36 @@ export class PhoneContractError extends Error {
 export class PhoneHttp {
   constructor(
     private readonly origin: URL,
-    private readonly token: string,
+    private readonly token: string | (() => Promise<string>),
     private readonly request: typeof fetch = fetch,
     private readonly timeoutMs = 35_000,
+    private readonly contact?: { success(): void, failure(): void },
   ) {}
 
   async json<T>(path: string, schema: z.ZodType<T>, signal: AbortSignal, body?: unknown): Promise<T> {
+    try {
+      const result = await this.requestJson(path, schema, signal, body)
+      this.contact?.success()
+      return result
+    } catch (error) {
+      if (!signal.aborted) {
+        this.contact?.failure()
+      }
+      throw error
+    }
+  }
+
+  private async requestJson<T>(path: string, schema: z.ZodType<T>, signal: AbortSignal, body?: unknown): Promise<T> {
     // Only adapter-authored same-origin paths can receive this credential.
     if (!path.startsWith('/api/') || path.startsWith('//') || new URL(path, this.origin).origin !== this.origin.origin) {
       throw new Error('Invalid phone API path')
     }
+    const token = typeof this.token === 'string' ? this.token : await this.token()
+    signal.throwIfAborted()
     const response = await this.request(new URL(path, this.origin), {
       method: body === undefined ? 'GET' : 'POST',
       headers: {
-        Authorization: `Bearer ${this.token}`,
+        Authorization: `Bearer ${token}`,
         'X-Pocket': '1',
         Accept: 'application/json',
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
